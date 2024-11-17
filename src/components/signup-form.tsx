@@ -2,13 +2,39 @@
 
 import { useState } from 'react'
 import { Mail, Lock, User } from 'lucide-react'
-import { signUpWithGoogle } from '@/lib/auth'
+import { signUpWithEmail, signUpWithGoogle } from '@/lib/auth'
 import { useRouter } from 'next/navigation'
 
 export function SignupForm() {
   const router = useRouter()
+  const [name, setName] = useState('')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [agreeTerms, setAgreeTerms] = useState(false)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError('')
+    setLoading(true)
+
+    if (password !== confirmPassword) {
+      setError('Passwords do not match')
+      setLoading(false)
+      return
+    }
+
+    try {
+      await signUpWithEmail(email, password, name)
+      router.push('/dashboard')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to sign up')
+    } finally {
+      setLoading(false)
+    }
+  }
 
   const handleGoogleSignUp = async () => {
     setError('')
@@ -44,10 +70,77 @@ export function SignupForm() {
       {/* Sign-up form card */}
       <div className="bg-white p-8 rounded-lg shadow-md w-96 z-10">
         <h1 className="text-4xl font-light text-center mb-8 font-['Inter']">Mirror</h1>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div className="relative">
+            <User className="absolute left-3 top-1/2 transform -translate-y-1/2 text-[#525252]" size={20} />
+            <input
+              type="text"
+              placeholder="Full Name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className="w-full pl-10 pr-4 py-2 border border-[#E5E5E5] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#404040]"
+              required
+            />
+          </div>
+          <div className="relative">
+            <Mail className="absolute left-3 top-1/2 transform -translate-y-1/2 text-[#525252]" size={20} />
+            <input
+              type="email"
+              placeholder="Email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              className="w-full pl-10 pr-4 py-2 border border-[#E5E5E5] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#404040]"
+              required
+            />
+          </div>
+          <div className="relative">
+            <Lock className="absolute left-3 top-1/2 transform -translate-y-1/2 text-[#525252]" size={20} />
+            <input
+              type="password"
+              placeholder="Password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="w-full pl-10 pr-4 py-2 border border-[#E5E5E5] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#404040]"
+              required
+            />
+          </div>
+          <div className="relative">
+            <Lock className="absolute left-3 top-1/2 transform -translate-y-1/2 text-[#525252]" size={20} />
+            <input
+              type="password"
+              placeholder="Confirm Password"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              className="w-full pl-10 pr-4 py-2 border border-[#E5E5E5] rounded-lg focus:outline-none focus:ring-2 focus:ring-[#404040]"
+              required
+            />
+          </div>
+          <div className="flex items-center">
+            <input
+              type="checkbox"
+              id="agree-terms"
+              checked={agreeTerms}
+              onChange={(e) => setAgreeTerms(e.target.checked)}
+              className="mr-2 accent-[#404040]"
+              required
+            />
+            <label htmlFor="agree-terms" className="text-sm text-[#525252]">
+              I agree to the <a href="#" className="text-[#404040] hover:underline">Terms of Service</a> and <a href="#" className="text-[#404040] hover:underline">Privacy Policy</a>
+            </label>
+          </div>
+          <button
+            type="submit"
+            disabled={loading}
+            className={`w-full bg-[#404040] text-white py-2 rounded-lg hover:bg-[#525252] transition-colors ${loading ? 'opacity-50 cursor-not-allowed' : ''}`}
+          >
+            {loading ? 'Signing up...' : 'Sign Up'}
+          </button>
+          {error && <p className="text-sm text-red-500 mt-2">{error}</p>}
+        </form>
 
         {/* Google sign-up option */}
         <div className="mt-6">
-          <p className="text-sm text-center text-[#525252] mb-4">Sign up with</p>
+          <p className="text-sm text-center text-[#525252] mb-4">Or sign up with</p>
           <button
             onClick={handleGoogleSignUp}
             disabled={loading}

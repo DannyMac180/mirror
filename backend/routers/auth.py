@@ -10,7 +10,10 @@ from ..database import get_db
 from ..models import User
 from ..schemas import UserCreate, Token, SocialLogin
 
-router = APIRouter()
+router = APIRouter(
+    prefix="/auth",
+    tags=["auth"]
+)
 
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")

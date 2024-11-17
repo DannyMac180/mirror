@@ -27,14 +27,16 @@ export const signUpWithEmail = async (email: string, password: string, name: str
       body: JSON.stringify({ email, password, name }),
     });
     
+    const data = await response.json();
+    
     if (!response.ok) {
-      throw new Error('Signup failed');
+      throw new Error(data.error || 'Signup failed');
     }
     
-    return await response.json();
+    return data;
   } catch (error) {
     console.error('Error during signup:', error);
-    throw error;
+    throw error instanceof Error ? error : new Error('Failed to sign up');
   }
 };
 
@@ -56,13 +58,15 @@ export const signUpWithGoogle = async () => {
       }),
     });
 
+    const data = await response.json();
+    
     if (!response.ok) {
-      throw new Error('Google auth failed');
+      throw new Error(data.error || 'Google auth failed');
     }
 
-    return await response.json();
+    return data;
   } catch (error) {
     console.error('Error during Google signup:', error);
-    throw error;
+    throw error instanceof Error ? error : new Error('Failed to sign up with Google');
   }
 };
