@@ -3,12 +3,12 @@ from sqlalchemy.orm import Session
 from typing import Optional
 from datetime import datetime, timedelta
 import requests
-import jwt
+from jose import jwt
 from passlib.context import CryptContext
 
-from ..database import get_db
-from ..models import User
-from ..schemas import UserCreate, Token, SocialLogin
+from backend.database import get_db
+from backend.models import User
+from backend.schemas import UserCreate, Token, SocialLogin
 
 router = APIRouter(
     prefix="/auth",

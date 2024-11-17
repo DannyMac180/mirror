@@ -19,7 +19,9 @@ const googleProvider = new GoogleAuthProvider();
 
 export const signUpWithEmail = async (email: string, password: string, name: string) => {
   try {
-    const response = await fetch('/api/auth/signup', {
+    console.log('Attempting to sign up with:', { email, name }); // Debug log
+    
+    const response = await fetch('http://localhost:8000/auth/signup', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -27,16 +29,23 @@ export const signUpWithEmail = async (email: string, password: string, name: str
       body: JSON.stringify({ email, password, name }),
     });
     
+    console.log('Response status:', response.status); // Debug log
+    
     const data = await response.json();
+    console.log('Response data:', data); // Debug log
     
     if (!response.ok) {
-      throw new Error(data.error || 'Signup failed');
+      throw new Error(data.detail || data.error || 'Signup failed');
     }
     
     return data;
   } catch (error) {
-    console.error('Error during signup:', error);
-    throw error instanceof Error ? error : new Error('Failed to sign up');
+    console.error('Detailed error during signup:', error);
+    if (error instanceof Error) {
+      throw error;
+    } else {
+      throw new Error('Failed to sign up');
+    }
   }
 };
 
@@ -45,7 +54,7 @@ export const signUpWithGoogle = async () => {
     const result = await signInWithPopup(auth, googleProvider);
     
     // Send the token to your backend
-    const response = await fetch('/api/auth/social-auth', {
+    const response = await fetch('http://localhost:8000/auth/social-auth', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -61,12 +70,16 @@ export const signUpWithGoogle = async () => {
     const data = await response.json();
     
     if (!response.ok) {
-      throw new Error(data.error || 'Google auth failed');
+      throw new Error(data.detail || data.error || 'Google auth failed');
     }
 
     return data;
   } catch (error) {
     console.error('Error during Google signup:', error);
-    throw error instanceof Error ? error : new Error('Failed to sign up with Google');
+    if (error instanceof Error) {
+      throw error;
+    } else {
+      throw new Error('Failed to sign up with Google');
+    }
   }
 };
