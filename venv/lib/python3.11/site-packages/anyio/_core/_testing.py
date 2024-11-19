@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Generator
-from typing import Any, cast
+from typing import Any, Awaitable, Generator
 
-from ._eventloop import get_async_backend
+from ._compat import DeprecatedAwaitableList, _warn_deprecation
+from ._eventloop import get_asynclib
 
 
 class TaskInfo:
@@ -45,12 +45,15 @@ class TaskInfo:
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(id={self.id!r}, name={self.name!r})"
 
-    def has_pending_cancellation(self) -> bool:
-        """
-        Return ``True`` if the task has a cancellation pending, ``False`` otherwise.
+    def __await__(self) -> Generator[None, None, TaskInfo]:
+        _warn_deprecation(self)
+        if False:
+            yield
 
-        """
-        return False
+        return self
+
+    def _unwrap(self) -> TaskInfo:
+        return self
 
 
 def get_current_task() -> TaskInfo:
@@ -60,19 +63,20 @@ def get_current_task() -> TaskInfo:
     :return: a representation of the current task
 
     """
-    return get_async_backend().get_current_task()
+    return get_asynclib().get_current_task()
 
 
-def get_running_tasks() -> list[TaskInfo]:
+def get_running_tasks() -> DeprecatedAwaitableList[TaskInfo]:
     """
     Return a list of running tasks in the current event loop.
 
     :return: a list of task info objects
 
     """
-    return cast("list[TaskInfo]", get_async_backend().get_running_tasks())
+    tasks = get_asynclib().get_running_tasks()
+    return DeprecatedAwaitableList(tasks, func=get_running_tasks)
 
 
 async def wait_all_tasks_blocked() -> None:
     """Wait until all other tasks are waiting for something."""
-    await get_async_backend().wait_all_tasks_blocked()
+    await get_asynclib().wait_all_tasks_blocked()

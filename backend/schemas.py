@@ -12,11 +12,11 @@ class Token(BaseModel):
     access_token: str
     token_type: str
 
-class SocialLogin(BaseModel):
-    provider: str  # Only "Google" is supported
-    token: str
+class GoogleSignUp(BaseModel):
     email: EmailStr
     name: str
+    provider: str
+    idToken: str
 
 class User(UserBase):
     id: int

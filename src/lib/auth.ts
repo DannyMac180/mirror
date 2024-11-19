@@ -51,31 +51,34 @@ export const signUpWithEmail = async (email: string, password: string, name: str
 
 export const signUpWithGoogle = async () => {
   try {
+    // Sign in with Google popup
     const result = await signInWithPopup(auth, googleProvider);
+    const user = result.user;
     
-    // Send the token to your backend
-    const response = await fetch('http://localhost:8000/auth/social-auth', {
+    // Send user data to our backend
+    const response = await fetch('http://localhost:8000/auth/google-signup', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        provider: 'Google',
-        token: await result.user.getIdToken(),
-        email: result.user.email,
-        name: result.user.displayName,
+        email: user.email,
+        name: user.displayName,
+        provider: 'google',
+        // Include the Google ID token for verification
+        idToken: await user.getIdToken(),
       }),
     });
 
     const data = await response.json();
     
     if (!response.ok) {
-      throw new Error(data.detail || data.error || 'Google auth failed');
+      throw new Error(data.detail || data.error || 'Google signup failed');
     }
-
+    
     return data;
   } catch (error) {
-    console.error('Error during Google signup:', error);
+    console.error('Detailed error during Google signup:', error);
     if (error instanceof Error) {
       throw error;
     } else {

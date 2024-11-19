@@ -2,28 +2,33 @@ from __future__ import annotations
 
 import types
 from abc import ABCMeta, abstractmethod
-from collections.abc import AsyncGenerator, Callable, Coroutine, Iterable
-from typing import Any, TypeVar
+from collections.abc import AsyncGenerator, Iterable
+from typing import Any, Callable, Coroutine, TypeVar
 
 _T = TypeVar("_T")
 
 
 class TestRunner(metaclass=ABCMeta):
     """
-    Encapsulates a running event loop. Every call made through this object will use the
-    same event loop.
+    Encapsulates a running event loop. Every call made through this object will use the same event
+    loop.
     """
 
     def __enter__(self) -> TestRunner:
         return self
 
-    @abstractmethod
     def __exit__(
         self,
         exc_type: type[BaseException] | None,
         exc_val: BaseException | None,
         exc_tb: types.TracebackType | None,
-    ) -> bool | None: ...
+    ) -> bool | None:
+        self.close()
+        return None
+
+    @abstractmethod
+    def close(self) -> None:
+        """Close the event loop."""
 
     @abstractmethod
     def run_asyncgen_fixture(

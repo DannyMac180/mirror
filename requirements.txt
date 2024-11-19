@@ -1,10 +1,10 @@
-fastapi==0.109.0
-uvicorn==0.27.0
-sqlalchemy==2.0.25
+fastapi==0.104.1
+uvicorn==0.24.0
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
+pydantic[email]==2.5.1
+google-auth==2.23.4
 python-dotenv==1.0.0
-psycopg2-binary==2.9.9
-pydantic==2.5.3
 requests==2.31.0
-pydantic[email]==2.5.3

@@ -5,10 +5,12 @@ from datetime import datetime, timedelta
 import requests
 from jose import jwt
 from passlib.context import CryptContext
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 
 from backend.database import get_db
 from backend.models import User
-from backend.schemas import UserCreate, Token, SocialLogin
+from backend.schemas import UserCreate, Token, GoogleSignUp, SocialLogin
 
 router = APIRouter(
     prefix="/auth",
@@ -22,6 +24,9 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 SECRET_KEY = "your-secret-key"  # Change this to a secure secret key
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Google OAuth settings
+GOOGLE_CLIENT_ID = "556094441078-4ek9c3jkj0g0jb0hbfvfv7p0kcfm6qqr.apps.googleusercontent.com"
 
 def create_access_token(data: dict):
     to_encode = data.copy()
@@ -56,6 +61,47 @@ def signup(user: UserCreate, db: Session = Depends(get_db)):
         data={"sub": db_user.email}
     )
     return {"access_token": access_token, "token_type": "bearer"}
+
+@router.post("/google-signup", response_model=Token)
+async def google_signup(auth_data: GoogleSignUp, db: Session = Depends(get_db)):
+    try:
+        # Verify the Google ID token
+        idinfo = id_token.verify_oauth2_token(
+            auth_data.idToken, 
+            google_requests.Request(), 
+            GOOGLE_CLIENT_ID
+        )
+
+        # Get user info from the verified token
+        email = idinfo['email']
+        name = idinfo.get('name', '')
+
+        # Check if user already exists
+        db_user = db.query(User).filter(User.email == email).first()
+        
+        if not db_user:
+            # Create new user
+            db_user = User(
+                email=email,
+                name=name,
+                provider="google"
+            )
+            db.add(db_user)
+            db.commit()
+            db.refresh(db_user)
+
+        # Create access token
+        access_token = create_access_token(
+            data={"sub": email}
+        )
+        
+        return {"access_token": access_token, "token_type": "bearer"}
+
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Google token"
+        )
 
 @router.post("/social-auth", response_model=Token)
 async def social_auth(auth_data: SocialLogin, db: Session = Depends(get_db)):
