@@ -51,11 +51,23 @@ export const signUpWithEmail = async (email: string, password: string, name: str
 
 export const signUpWithGoogle = async () => {
   try {
+    console.log('Starting Google sign-up process...');
+    
     // Sign in with Google popup
     const result = await signInWithPopup(auth, googleProvider);
     const user = result.user;
     
+    console.log('Google sign-in successful:', {
+      email: user.email,
+      name: user.displayName,
+    });
+    
+    // Get the ID token
+    const idToken = await user.getIdToken();
+    console.log('Got ID token:', idToken.substring(0, 20) + '...');
+    
     // Send user data to our backend
+    console.log('Sending data to backend...');
     const response = await fetch('http://localhost:8000/auth/google-signup', {
       method: 'POST',
       headers: {
@@ -65,14 +77,16 @@ export const signUpWithGoogle = async () => {
         email: user.email,
         name: user.displayName,
         provider: 'google',
-        // Include the Google ID token for verification
-        idToken: await user.getIdToken(),
+        idToken: idToken,
       }),
     });
 
+    console.log('Backend response status:', response.status);
     const data = await response.json();
+    console.log('Backend response data:', data);
     
     if (!response.ok) {
+      console.error('Backend error:', data);
       throw new Error(data.detail || data.error || 'Google signup failed');
     }
     
@@ -80,8 +94,11 @@ export const signUpWithGoogle = async () => {
   } catch (error) {
     console.error('Detailed error during Google signup:', error);
     if (error instanceof Error) {
+      console.error('Error message:', error.message);
+      console.error('Error stack:', error.stack);
       throw error;
     } else {
+      console.error('Unknown error type:', error);
       throw new Error('Failed to sign up with Google');
     }
   }

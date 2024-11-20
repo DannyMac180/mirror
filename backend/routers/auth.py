@@ -7,6 +7,11 @@ from jose import jwt
 from passlib.context import CryptContext
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 from backend.database import get_db
 from backend.models import User
@@ -21,12 +26,12 @@ router = APIRouter(
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # JWT settings
-SECRET_KEY = "your-secret-key"  # Change this to a secure secret key
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 # Google OAuth settings
-GOOGLE_CLIENT_ID = "556094441078-4ek9c3jkj0g0jb0hbfvfv7p0kcfm6qqr.apps.googleusercontent.com"
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
 def create_access_token(data: dict):
     to_encode = data.copy()
@@ -65,12 +70,17 @@ def signup(user: UserCreate, db: Session = Depends(get_db)):
 @router.post("/google-signup", response_model=Token)
 async def google_signup(auth_data: GoogleSignUp, db: Session = Depends(get_db)):
     try:
+        print(f"Received Google sign-up request for email: {auth_data.email}")
+        print(f"Using Google Client ID: {GOOGLE_CLIENT_ID}")
+        
         # Verify the Google ID token
         idinfo = id_token.verify_oauth2_token(
             auth_data.idToken, 
             google_requests.Request(), 
             GOOGLE_CLIENT_ID
         )
+        
+        print(f"Token verification successful. Token info: {idinfo}")
 
         # Get user info from the verified token
         email = idinfo['email']
@@ -89,6 +99,9 @@ async def google_signup(auth_data: GoogleSignUp, db: Session = Depends(get_db)):
             db.add(db_user)
             db.commit()
             db.refresh(db_user)
+            print(f"Created new user: {email}")
+        else:
+            print(f"User already exists: {email}")
 
         # Create access token
         access_token = create_access_token(
@@ -97,10 +110,17 @@ async def google_signup(auth_data: GoogleSignUp, db: Session = Depends(get_db)):
         
         return {"access_token": access_token, "token_type": "bearer"}
 
-    except ValueError:
+    except ValueError as e:
+        print(f"Token verification failed: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid Google token"
+            detail=f"Invalid Google token: {str(e)}"
+        )
+    except Exception as e:
+        print(f"Unexpected error during Google sign-up: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
         )
 
 @router.post("/social-auth", response_model=Token)

@@ -18,6 +18,12 @@ class GoogleSignUp(BaseModel):
     provider: str
     idToken: str
 
+class SocialLogin(BaseModel):
+    email: EmailStr
+    name: str
+    provider: str
+    token: str
+
 class User(UserBase):
     id: int
     provider: Optional[str] = None
