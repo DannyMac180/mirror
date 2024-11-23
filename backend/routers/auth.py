@@ -9,6 +9,8 @@ from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 import os
 from dotenv import load_dotenv
+import firebase_admin
+from firebase_admin import credentials, auth as firebase_auth
 
 # Load environment variables
 load_dotenv()
@@ -16,6 +18,10 @@ load_dotenv()
 from backend.database import get_db
 from backend.models import User
 from backend.schemas import UserCreate, Token, GoogleSignUp, SocialLogin
+
+# Initialize Firebase Admin
+cred = credentials.Certificate("backend/firebase-service-account.json")
+firebase_admin.initialize_app(cred)
 
 router = APIRouter(
     prefix="/auth",
@@ -70,27 +76,15 @@ def signup(user: UserCreate, db: Session = Depends(get_db)):
 @router.post("/google-signup", response_model=Token)
 async def google_signup(auth_data: GoogleSignUp, db: Session = Depends(get_db)):
     try:
-        # Create a Request object with caching disabled
-        request = google_requests.Request(session=requests.Session())
+        # Verify the Firebase ID token
+        decoded_token = firebase_auth.verify_id_token(auth_data.idToken)
         
-        # Verify the Google ID token
-        idinfo = id_token.verify_oauth2_token(
-            auth_data.idToken,
-            request,
-            GOOGLE_CLIENT_ID,
-            clock_skew_in_seconds=10
-        )
-
-        # Verify issuer
-        if idinfo['iss'] not in ['accounts.google.com', 'https://accounts.google.com']:
-            raise ValueError('Wrong issuer.')
-            
         # Get user info from the verified token
-        email = idinfo['email']
-        if not idinfo.get('email_verified', False):
+        email = decoded_token['email']
+        if not decoded_token.get('email_verified', False):
             raise ValueError('Email not verified by Google.')
             
-        name = idinfo.get('name', '')
+        name = decoded_token.get('name', '')
 
         # Check if user already exists
         db_user = db.query(User).filter(User.email == email).first()
@@ -116,7 +110,7 @@ async def google_signup(auth_data: GoogleSignUp, db: Session = Depends(get_db)):
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid Google token: {str(e)}"
+            detail=f"Invalid token: {str(e)}"
         )
     except Exception as e:
         raise HTTPException(

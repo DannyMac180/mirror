@@ -38,3 +38,12 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Firebase
+*firebase-adminsdk*.json
+backend/*firebase-adminsdk*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class

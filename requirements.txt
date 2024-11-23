@@ -9,3 +9,4 @@ google-auth==2.25.2
 google-auth-oauthlib==1.2.0
 python-dotenv==1.0.0
 requests==2.31.0
+firebase-admin==6.2.0
