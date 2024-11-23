@@ -70,20 +70,26 @@ def signup(user: UserCreate, db: Session = Depends(get_db)):
 @router.post("/google-signup", response_model=Token)
 async def google_signup(auth_data: GoogleSignUp, db: Session = Depends(get_db)):
     try:
-        print(f"Received Google sign-up request for email: {auth_data.email}")
-        print(f"Using Google Client ID: {GOOGLE_CLIENT_ID}")
+        # Create a Request object with caching disabled
+        request = google_requests.Request(session=requests.Session())
         
         # Verify the Google ID token
         idinfo = id_token.verify_oauth2_token(
-            auth_data.idToken, 
-            google_requests.Request(), 
-            GOOGLE_CLIENT_ID
+            auth_data.idToken,
+            request,
+            GOOGLE_CLIENT_ID,
+            clock_skew_in_seconds=10
         )
-        
-        print(f"Token verification successful. Token info: {idinfo}")
 
+        # Verify issuer
+        if idinfo['iss'] not in ['accounts.google.com', 'https://accounts.google.com']:
+            raise ValueError('Wrong issuer.')
+            
         # Get user info from the verified token
         email = idinfo['email']
+        if not idinfo.get('email_verified', False):
+            raise ValueError('Email not verified by Google.')
+            
         name = idinfo.get('name', '')
 
         # Check if user already exists
@@ -99,9 +105,6 @@ async def google_signup(auth_data: GoogleSignUp, db: Session = Depends(get_db)):
             db.add(db_user)
             db.commit()
             db.refresh(db_user)
-            print(f"Created new user: {email}")
-        else:
-            print(f"User already exists: {email}")
 
         # Create access token
         access_token = create_access_token(
@@ -111,16 +114,14 @@ async def google_signup(auth_data: GoogleSignUp, db: Session = Depends(get_db)):
         return {"access_token": access_token, "token_type": "bearer"}
 
     except ValueError as e:
-        print(f"Token verification failed: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Invalid Google token: {str(e)}"
         )
     except Exception as e:
-        print(f"Unexpected error during Google sign-up: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            detail=f"Error during Google signup: {str(e)}"
         )
 
 @router.post("/social-auth", response_model=Token)
