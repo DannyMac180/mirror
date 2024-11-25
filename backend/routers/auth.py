@@ -20,7 +20,7 @@ from backend.models import User
 from backend.schemas import UserCreate, Token, GoogleSignUp, SocialLogin
 
 # Initialize Firebase Admin
-cred = credentials.Certificate("backend/firebase-service-account.json")
+cred = credentials.Certificate("backend/mirror-66aec-firebase-adminsdk-p287z-a39b09a48c.json")
 firebase_admin.initialize_app(cred)
 
 router = APIRouter(
