@@ -103,3 +103,65 @@ export const signUpWithGoogle = async () => {
     }
   }
 };
+
+export const signInWithEmail = async (email: string, password: string) => {
+  try {
+    const response = await fetch('http://localhost:8000/auth/login', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ email, password }),
+    });
+    
+    const data = await response.json();
+    
+    if (!response.ok) {
+      throw new Error(data.detail || data.error || 'Login failed');
+    }
+    
+    return data;
+  } catch (error) {
+    console.error('Error during login:', error);
+    if (error instanceof Error) {
+      throw error;
+    } else {
+      throw new Error('Failed to sign in');
+    }
+  }
+};
+
+export const signInWithGoogle = async () => {
+  try {
+    const result = await signInWithPopup(auth, googleProvider);
+    const user = result.user;
+    
+    // Send the Google user data to your backend
+    const response = await fetch('http://localhost:8000/auth/google-login', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        email: user.email,
+        name: user.displayName,
+        googleId: user.uid,
+      }),
+    });
+    
+    const data = await response.json();
+    
+    if (!response.ok) {
+      throw new Error(data.detail || data.error || 'Google login failed');
+    }
+    
+    return data;
+  } catch (error) {
+    console.error('Error during Google sign-in:', error);
+    if (error instanceof Error) {
+      throw error;
+    } else {
+      throw new Error('Failed to sign in with Google');
+    }
+  }
+};
