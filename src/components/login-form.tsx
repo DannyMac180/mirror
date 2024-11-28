@@ -4,6 +4,7 @@ import { useState } from 'react'
 import { Mail, Lock } from 'lucide-react'
 import { signInWithEmail, signInWithGoogle } from '@/lib/auth'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 
 export function LoginForm() {
   const router = useRouter()
@@ -130,7 +131,9 @@ export function LoginForm() {
 
         <div className="mt-6 text-center">
           <span className="text-sm text-[#525252]">Don't have an account? </span>
-          <a href="#" className="text-sm text-[#404040] font-semibold hover:underline">Sign up</a>
+          <Link href="/sign-up" className="text-sm text-[#404040] font-semibold hover:underline">
+            Sign up
+          </Link>
         </div>
       </div>
     </div>

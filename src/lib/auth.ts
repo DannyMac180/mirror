@@ -10,12 +10,24 @@ const firebaseConfig = {
   appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID
 };
 
-// Initialize Firebase
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
+// Check if Firebase config is properly set
+const isFirebaseConfigValid = Object.values(firebaseConfig).every(value => value !== undefined && value !== '');
+if (!isFirebaseConfigValid) {
+  console.error('Firebase configuration is incomplete. Please check your environment variables.');
+}
 
-// Initialize Google provider
-const googleProvider = new GoogleAuthProvider();
+// Initialize Firebase
+let app;
+let auth;
+let googleProvider;
+
+try {
+  app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  googleProvider = new GoogleAuthProvider();
+} catch (error) {
+  console.error('Error initializing Firebase:', error);
+}
 
 export const signUpWithEmail = async (email: string, password: string, name: string) => {
   try {
@@ -133,9 +145,17 @@ export const signInWithEmail = async (email: string, password: string) => {
 
 export const signInWithGoogle = async () => {
   try {
+    if (!auth || !googleProvider) {
+      throw new Error('Firebase authentication is not properly initialized');
+    }
+
     const result = await signInWithPopup(auth, googleProvider);
     const user = result.user;
     
+    if (!user.email) {
+      throw new Error('No email provided from Google account');
+    }
+
     // Send the Google user data to your backend
     const response = await fetch('http://localhost:8000/auth/google-login', {
       method: 'POST',
@@ -144,20 +164,20 @@ export const signInWithGoogle = async () => {
       },
       body: JSON.stringify({
         email: user.email,
-        name: user.displayName,
+        name: user.displayName || '',
         googleId: user.uid,
       }),
     });
     
-    const data = await response.json();
-    
     if (!response.ok) {
-      throw new Error(data.detail || data.error || 'Google login failed');
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.detail || data.error || `Google login failed with status ${response.status}`);
     }
     
+    const data = await response.json();
     return data;
   } catch (error) {
-    console.error('Error during Google sign-in:', error);
+    console.error('Detailed error during Google sign-in:', error);
     if (error instanceof Error) {
       throw error;
     } else {
