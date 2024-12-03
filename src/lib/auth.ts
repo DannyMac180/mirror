@@ -157,15 +157,16 @@ export const signInWithGoogle = async () => {
     }
 
     // Send the Google user data to your backend
-    const response = await fetch('http://localhost:8000/auth/google-login', {
+    const response = await fetch('http://localhost:8000/auth/social-auth', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
+        provider: 'Google',
+        token: await user.getIdToken(),
         email: user.email,
         name: user.displayName || '',
-        googleId: user.uid,
       }),
     });
     
