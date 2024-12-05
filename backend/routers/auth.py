@@ -127,33 +127,29 @@ async def social_auth(auth_data: SocialLogin, db: Session = Depends(get_db)):
         )
     
     try:
-        print(f"Verifying token: {auth_data.token[:20]}...")  # Log first 20 chars of token
-        # Verify the token with Google
-        response = requests.get(
-            f"https://oauth2.googleapis.com/tokeninfo?id_token={auth_data.token}"
-        )
-        print(f"Google API response status: {response.status_code}")
-        
-        if not response.ok:
-            error_detail = response.json() if response.content else "No error details available"
-            print(f"Google API error: {error_detail}")
+        print(f"Verifying token: {auth_data.token[:20]}...")
+        # Use Firebase Admin SDK to verify the token
+        try:
+            decoded_token = firebase_auth.verify_id_token(auth_data.token)
+            email = decoded_token['email']
+            name = decoded_token.get('name', auth_data.name)
+            print(f"Token verified for email: {email}")
+        except Exception as e:
+            print(f"Token verification failed: {str(e)}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Invalid Google token: {error_detail}"
+                detail=f"Invalid token: {str(e)}"
             )
         
-        token_info = response.json()
-        print(f"Token info received: {token_info}")
-        
         # Check if user exists
-        user = db.query(User).filter(User.email == auth_data.email).first()
+        user = db.query(User).filter(User.email == email).first()
         
         if not user:
-            print(f"Creating new user with email: {auth_data.email}")
+            print(f"Creating new user with email: {email}")
             # Create new user
             user = User(
-                email=auth_data.email,
-                name=auth_data.name,
+                email=email,
+                name=name,
                 provider="Google"
             )
             db.add(user)

@@ -149,12 +149,17 @@ export const signInWithGoogle = async () => {
       throw new Error('Firebase authentication is not properly initialized');
     }
 
+    // Sign in with Google popup
     const result = await signInWithPopup(auth, googleProvider);
     const user = result.user;
     
     if (!user.email) {
       throw new Error('No email provided from Google account');
     }
+
+    // Get the ID token
+    const token = await user.getIdToken(true);  // Force refresh to ensure token is fresh
+    console.log('Got fresh ID token');
 
     // Send the Google user data to your backend
     const response = await fetch('http://localhost:8000/auth/social-auth', {
@@ -163,10 +168,10 @@ export const signInWithGoogle = async () => {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        provider: 'Google',
-        token: await user.getIdToken(),
         email: user.email,
         name: user.displayName || '',
+        provider: 'Google',
+        token: token
       }),
     });
     
