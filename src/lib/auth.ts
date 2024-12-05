@@ -1,5 +1,5 @@
 import { initializeApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
+import { getAuth, GoogleAuthProvider, signInWithPopup, Auth } from 'firebase/auth';
 
 const firebaseConfig = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -18,8 +18,8 @@ if (!isFirebaseConfigValid) {
 
 // Initialize Firebase
 let app;
-let auth;
-let googleProvider;
+let auth: Auth;
+let googleProvider: GoogleAuthProvider;
 
 try {
   app = initializeApp(firebaseConfig);

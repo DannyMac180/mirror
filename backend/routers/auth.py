@@ -127,22 +127,29 @@ async def social_auth(auth_data: SocialLogin, db: Session = Depends(get_db)):
         )
     
     try:
+        print(f"Verifying token: {auth_data.token[:20]}...")  # Log first 20 chars of token
         # Verify the token with Google
         response = requests.get(
             f"https://oauth2.googleapis.com/tokeninfo?id_token={auth_data.token}"
         )
+        print(f"Google API response status: {response.status_code}")
+        
         if not response.ok:
+            error_detail = response.json() if response.content else "No error details available"
+            print(f"Google API error: {error_detail}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid Google token"
+                detail=f"Invalid Google token: {error_detail}"
             )
         
         token_info = response.json()
+        print(f"Token info received: {token_info}")
         
         # Check if user exists
         user = db.query(User).filter(User.email == auth_data.email).first()
         
         if not user:
+            print(f"Creating new user with email: {auth_data.email}")
             # Create new user
             user = User(
                 email=auth_data.email,
@@ -152,6 +159,8 @@ async def social_auth(auth_data: SocialLogin, db: Session = Depends(get_db)):
             db.add(user)
             db.commit()
             db.refresh(user)
+        else:
+            print(f"Found existing user: {user.email}")
         
         # Create access token
         access_token = create_access_token(
@@ -160,6 +169,10 @@ async def social_auth(auth_data: SocialLogin, db: Session = Depends(get_db)):
         return {"access_token": access_token, "token_type": "bearer"}
     
     except Exception as e:
+        print(f"Error in social_auth: {str(e)}")
+        print(f"Error type: {type(e)}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
