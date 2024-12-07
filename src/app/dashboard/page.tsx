@@ -1,9 +1,9 @@
-import { DailyPrompt } from './components/daily-prompt'
-import { QuickJournal } from './components/quick-journal'
-import { ProgressOverview } from './components/progress-overview'
-import { RecentEntries } from './components/recent-entries'
-import { GoalsProgress } from './components/goals-progress'
-import { ValuesAlignment } from './components/values-alignment'
+import { DailyPrompt } from '@/components/daily-prompt'
+import { QuickJournal } from '@/components/quick-journal'
+import { ProgressOverview } from '@/components/progress-overview'
+import { RecentEntries } from '@/components/recent-entries'
+import { GoalsProgress } from '@/components/goals-progress'
+import { ValuesAlignment } from '@/components/values-alignment'
 
 export default function Dashboard() {
   return (
