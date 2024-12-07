@@ -8,7 +8,7 @@ export function RecentEntries() {
   ]
 
   return (
-    <Card className="card-gradient border-none rounded-none">
+    <Card className="card-gradient border-none rounded-none hover-lift hover-darken">
       <CardHeader>
         <CardTitle className="font-mono tracking-wider text-sm">RECENT ENTRIES</CardTitle>
       </CardHeader>

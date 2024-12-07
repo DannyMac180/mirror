@@ -8,7 +8,7 @@ export function ValuesAlignment() {
   ]
 
   return (
-    <Card className="card-gradient border-none rounded-none">
+    <Card className="card-gradient border-none rounded-none hover-lift hover-darken">
       <CardHeader>
         <CardTitle className="font-mono tracking-wider text-sm">VALUES ALIGNMENT</CardTitle>
       </CardHeader>

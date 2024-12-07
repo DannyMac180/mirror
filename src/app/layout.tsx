@@ -1,6 +1,6 @@
 import './globals.css'
 import { IBM_Plex_Mono } from 'next/font/google'
-import { TopNav } from '@/components/top-nav'
+import { TopNav } from '../components/top-nav'
 
 const mono = IBM_Plex_Mono({ 
   subsets: ['latin'],
