@@ -18,7 +18,7 @@ export function TopNav() {
           <div className="flex items-center space-x-8">
             <Link href="/" className="text-lg font-mono tracking-wider">MIRROR</Link>
             <div className="hidden md:flex space-x-8">
-              <Link href="/journal" className="text-sm tracking-wider hover:text-primary">JOURNAL</Link>
+              <Link href="/my-mirror" className="text-sm tracking-wider hover:text-primary">MY MIRROR</Link>
               <Link href="/library" className="text-sm tracking-wider hover:text-primary">LIBRARY</Link>
               <Link href="/goals" className="text-sm tracking-wider hover:text-primary">GOALS</Link>
               <Link href="/insights" className="text-sm tracking-wider hover:text-primary">INSIGHTS</Link>
