@@ -9,18 +9,18 @@ export function GoalsProgress() {
   ]
 
   return (
-    <Card className="hover:shadow-md transition-shadow">
+    <Card className="card-gradient border-none rounded-none">
       <CardHeader>
-        <CardTitle>Goals Progress</CardTitle>
+        <CardTitle className="font-mono tracking-wider text-sm">GOALS PROGRESS</CardTitle>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent className="space-y-6">
         {goals.map((goal, index) => (
           <div key={index}>
-            <div className="flex justify-between mb-1">
-              <span>{goal.name}</span>
-              <span>{goal.progress}%</span>
+            <div className="flex justify-between mb-2">
+              <span className="text-sm">{goal.name}</span>
+              <span className="font-mono text-xs">{goal.progress}%</span>
             </div>
-            <Progress value={goal.progress} />
+            <Progress value={goal.progress} className="rounded-none" />
           </div>
         ))}
       </CardContent>

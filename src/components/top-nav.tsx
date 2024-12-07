@@ -12,32 +12,33 @@ import { User } from 'lucide-react'
 
 export function TopNav() {
   return (
-    <nav className="bg-white shadow-sm">
-      <div className="container mx-auto px-4 py-3 flex items-center justify-between">
-        <div className="flex items-center space-x-4">
-          <Link href="/" className="text-2xl font-bold text-primary">Mirror</Link>
-          <div className="hidden md:flex space-x-4">
-            <Link href="/journal" className="text-gray-600 hover:text-primary">Journal</Link>
-            <Link href="/library" className="text-gray-600 hover:text-primary">Library</Link>
-            <Link href="/goals" className="text-gray-600 hover:text-primary">Goals</Link>
-            <Link href="/insights" className="text-gray-600 hover:text-primary">Insights</Link>
+    <nav className="border-b border-primary/20">
+      <div className="container mx-auto px-4">
+        <div className="flex items-center justify-between h-16">
+          <div className="flex items-center space-x-8">
+            <Link href="/" className="text-lg font-mono tracking-wider">MIRROR</Link>
+            <div className="hidden md:flex space-x-8">
+              <Link href="/journal" className="text-sm tracking-wider hover:text-primary">JOURNAL</Link>
+              <Link href="/library" className="text-sm tracking-wider hover:text-primary">LIBRARY</Link>
+              <Link href="/goals" className="text-sm tracking-wider hover:text-primary">GOALS</Link>
+              <Link href="/insights" className="text-sm tracking-wider hover:text-primary">INSIGHTS</Link>
+            </div>
           </div>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="ghost" size="icon" className="rounded-none">
+                <User className="h-5 w-5" />
+                <span className="sr-only">Open profile menu</span>
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="rounded-none">
+              <DropdownMenuLabel className="font-mono">PROFILE</DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem className="font-mono">SETTINGS</DropdownMenuItem>
+              <DropdownMenuItem className="font-mono">LOG OUT</DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="icon">
-              <User className="h-5 w-5" />
-              <span className="sr-only">Open profile menu</span>
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            <DropdownMenuLabel>My Account</DropdownMenuLabel>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem>Profile</DropdownMenuItem>
-            <DropdownMenuItem>Settings</DropdownMenuItem>
-            <DropdownMenuItem>Log out</DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
       </div>
     </nav>
   )

@@ -8,16 +8,16 @@ export function ValuesAlignment() {
   ]
 
   return (
-    <Card className="hover:shadow-md transition-shadow">
+    <Card className="card-gradient border-none rounded-none">
       <CardHeader>
-        <CardTitle>Values Alignment</CardTitle>
+        <CardTitle className="font-mono tracking-wider text-sm">VALUES ALIGNMENT</CardTitle>
       </CardHeader>
       <CardContent>
-        <ul className="space-y-2">
+        <ul className="space-y-4">
           {values.map((value, index) => (
             <li key={index} className="flex justify-between">
-              <span>{value.name}</span>
-              <span className="font-semibold">{value.score}/10</span>
+              <span className="text-sm">{value.name}</span>
+              <span className="font-mono text-xs">{value.score}/10</span>
             </li>
           ))}
         </ul>

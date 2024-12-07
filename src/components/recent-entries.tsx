@@ -8,16 +8,16 @@ export function RecentEntries() {
   ]
 
   return (
-    <Card className="hover:shadow-md transition-shadow">
+    <Card className="card-gradient border-none rounded-none">
       <CardHeader>
-        <CardTitle>Recent Journal Entries</CardTitle>
+        <CardTitle className="font-mono tracking-wider text-sm">RECENT ENTRIES</CardTitle>
       </CardHeader>
       <CardContent>
-        <ul className="space-y-2">
+        <ul className="space-y-4">
           {entries.map((entry, index) => (
             <li key={index} className="flex justify-between">
-              <span>{entry.title}</span>
-              <span className="text-sm text-gray-500">{entry.date}</span>
+              <span className="text-sm">{entry.title}</span>
+              <span className="font-mono text-xs text-muted-foreground">{entry.date}</span>
             </li>
           ))}
         </ul>

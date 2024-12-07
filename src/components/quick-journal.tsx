@@ -4,13 +4,13 @@ import { PenTool } from 'lucide-react'
 
 export function QuickJournal() {
   return (
-    <Card className="hover:shadow-md transition-shadow">
+    <Card className="card-gradient border-none rounded-none">
       <CardHeader>
-        <CardTitle>Quick Journal</CardTitle>
+        <CardTitle className="font-mono tracking-wider text-sm">NEW ENTRY</CardTitle>
       </CardHeader>
       <CardContent>
-        <Button className="w-full">
-          <PenTool className="mr-2 h-4 w-4" /> Start Writing
+        <Button className="w-full rounded-none font-mono text-xs tracking-wider" variant="outline">
+          <PenTool className="mr-2 h-4 w-4" /> START WRITING
         </Button>
       </CardContent>
     </Card>

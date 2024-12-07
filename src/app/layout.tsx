@@ -1,8 +1,11 @@
 import './globals.css'
-import { Inter } from 'next/font/google'
+import { IBM_Plex_Mono } from 'next/font/google'
 import { TopNav } from '@/components/top-nav'
 
-const inter = Inter({ subsets: ['latin'] })
+const mono = IBM_Plex_Mono({ 
+  subsets: ['latin'],
+  weight: ['400', '500'],
+})
 
 export const metadata = {
   title: 'Mirror Dashboard',
@@ -16,8 +19,11 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body>
-        {children}
+      <body className={`${mono.className} bg-background text-foreground`}>
+        <TopNav />
+        <main className="container mx-auto px-4 py-12">
+          {children}
+        </main>
       </body>
     </html>
   )
