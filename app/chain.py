@@ -16,7 +16,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_google_vertexai import ChatVertexAI
 
 LOCATION = "us-central1"
-LLM = "gemini-1.5-flash-002"
+LLM = "gemini-2.0-flash-exp"
 
 
 llm = ChatVertexAI(
