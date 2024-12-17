@@ -153,6 +153,8 @@ class SideBar:
                     "csv",
                     "tsv",
                     "xlsx",
+                    "md",
+                    "markdown"
                 ],
             )
             if self.uploaded_files and self.st.session_state.checkbox_state:

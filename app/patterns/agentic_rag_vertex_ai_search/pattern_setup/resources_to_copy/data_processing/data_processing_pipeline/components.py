@@ -25,20 +25,22 @@ from kfp.dsl import component, Dataset, Output, Input
         "langchain-google-vertexai",
         "pypdf",
         "pydantic==2.9.2",
+        "markdown"
     ]
 )
 def process_data(
     output_files: Output[Dataset],
     embedding_model: str,
-    pdf_url: str,
+    file_url: str,
+    file_type: str = "pdf",
 ) -> None:
-    """Processes PDF document by splitting into chunks and generating embeddings."""
+    """Processes document by splitting into chunks and generating embeddings."""
     import json
     import logging
     import uuid
     import vertexai
     from langchain.text_splitter import RecursiveCharacterTextSplitter
-    from langchain_community.document_loaders import PyPDFLoader
+    from langchain_community.document_loaders import PyPDFLoader, TextLoader
     from langchain_core.documents import Document
     from langchain_core.embeddings import Embeddings
     from langchain_google_vertexai import VertexAIEmbeddings
@@ -47,9 +49,15 @@ def process_data(
     vertexai.init()
     embedding = VertexAIEmbeddings(model_name=embedding_model)
 
-    def pre_process_data(url: str) -> List[Document]:
+    def pre_process_data(url: str, file_type: str) -> List[Document]:
         """Load and split documents from a given URL."""
-        loader = PyPDFLoader(url)
+        if file_type.lower() == "pdf":
+            loader = PyPDFLoader(url)
+        elif file_type.lower() in ["md", "markdown", "txt"]:
+            loader = TextLoader(url)
+        else:
+            raise ValueError(f"Unsupported file type: {file_type}")
+            
         documents = loader.load()
 
         text_splitter = RecursiveCharacterTextSplitter(
@@ -57,7 +65,7 @@ def process_data(
         )
         doc_splits = text_splitter.split_documents(documents)
         for document in doc_splits:
-            document.metadata["title"] = pdf_url
+            document.metadata["title"] = file_url
             document.metadata["id"] = str(uuid.uuid4())
 
         return doc_splits
@@ -96,7 +104,7 @@ def process_data(
                 f.write(json.dumps(dictionary) + "\n")
 
     logging.info("Starting document pre-processing...")
-    docs = pre_process_data(pdf_url)
+    docs = pre_process_data(file_url, file_type)
     logging.info(f"Pre-processed {len(docs)} document chunks")
 
     logging.info("Generating embeddings...")

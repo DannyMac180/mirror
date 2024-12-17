@@ -126,6 +126,13 @@ def get_parts_from_files(
                     },
                     "file_name": uploaded_file.name,
                 }
+            elif uploaded_file.type in ["text/markdown", "text/md"] or uploaded_file.name.endswith((".md", ".markdown")):
+                content = {
+                    "type": "media",
+                    "data": base64.b64encode(im_bytes).decode("utf-8"),
+                    "file_name": uploaded_file.name,
+                    "mime_type": "text/markdown",
+                }
             else:
                 content = {
                     "type": "media",

@@ -22,12 +22,17 @@ def pipeline(
     region_vertex_ai_search: str,
     data_store_id: str,
     embedding_model: str = "text-embedding-004",
-    pdf_url: str = "https://services.google.com/fh/files/misc/practitioners_guide_to_mlops_whitepaper.pdf",
+    file_url: str = "https://services.google.com/fh/files/misc/practitioners_guide_to_mlops_whitepaper.pdf",
+    file_type: str = "pdf",
 ) -> None:
-    """Processes a PDF document and ingests it into Vertex AI Search datastore."""
+    """Processes a document and ingests it into Vertex AI Search datastore."""
 
-    # Process the PDF document and generate embeddings
-    processed_data = process_data(embedding_model=embedding_model, pdf_url=pdf_url)
+    # Process the document and generate embeddings
+    processed_data = process_data(
+        embedding_model=embedding_model, 
+        file_url=file_url,
+        file_type=file_type
+    )
 
     # Ingest the processed data into Vertex AI Search datastore
     ingest_data_in_datastore(
