@@ -40,6 +40,8 @@ class SideBar:
             st (Any): The Streamlit object for rendering UI components.
         """
         self.st = st
+        self.uploaded_files = None
+        self.uploaded_folder = None
 
     def init_side_bar(self) -> None:
         """Initialize and render the sidebar components."""
@@ -146,6 +148,7 @@ class SideBar:
             )
 
             if use_folder_upload:
+                self.uploaded_files = None  # Reset files when in folder mode
                 self.uploaded_folder = self.st.file_uploader(
                     "Upload a .zip file containing your documents",
                     type=["zip"],
@@ -154,7 +157,7 @@ class SideBar:
                 if self.uploaded_folder:
                     self.st.info(f"Processing {self.uploaded_folder.name}...")
             else:
-                self.uploaded_folder = None
+                self.uploaded_folder = None  # Reset folder when in files mode
                 self.uploaded_files = self.st.file_uploader(
                     label="Send files from local",
                     accept_multiple_files=True,
