@@ -138,27 +138,40 @@ class SideBar:
                 "Upload to GCS first (suggested)", value=False, help=HELP_GCS_CHECKBOX
             )
 
-            self.uploaded_files = self.st.file_uploader(
-                label="Send files from local",
-                accept_multiple_files=True,
-                key=f"uploader_images_{self.st.session_state.uploader_key}",
-                type=[
-                    "png",
-                    "jpg",
-                    "jpeg",
-                    "txt",
-                    "docx",
-                    "pdf",
-                    "rtf",
-                    "csv",
-                    "tsv",
-                    "xlsx",
-                    "md",
-                    "markdown"
-                ],
+            # Add folder upload toggle
+            use_folder_upload = self.st.checkbox(
+                "Upload Entire Folder", 
+                value=False,
+                help="Upload multiple files from a .zip file"
             )
-            if self.uploaded_files and self.st.session_state.checkbox_state:
-                upload_files_to_gcs(self.st, bucket_name, self.uploaded_files)
+
+            if use_folder_upload:
+                self.uploaded_folder = self.st.file_uploader(
+                    "Upload a .zip file containing your documents",
+                    type=["zip"],
+                    key=f"folder_uploader_{self.st.session_state.uploader_key}"
+                )
+                if self.uploaded_folder:
+                    self.st.info(f"Processing {self.uploaded_folder.name}...")
+            else:
+                self.uploaded_folder = None
+                self.uploaded_files = self.st.file_uploader(
+                    label="Send files from local",
+                    accept_multiple_files=True,
+                    key=f"uploader_images_{self.st.session_state.uploader_key}",
+                    type=[
+                        "png", "jpg", "jpeg", "txt", "docx", "pdf",
+                        "rtf", "csv", "tsv", "xlsx", "md", "markdown"
+                    ],
+                )
+
+            if (self.uploaded_files or self.uploaded_folder) and self.st.session_state.checkbox_state:
+                upload_files_to_gcs(
+                    self.st, 
+                    bucket_name, 
+                    self.uploaded_files if self.uploaded_files else [self.uploaded_folder],
+                    is_folder=bool(self.uploaded_folder)
+                )
 
             self.st.divider()
 
