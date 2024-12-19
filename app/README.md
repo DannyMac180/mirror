@@ -2,7 +2,7 @@
 
 This folder implements a chatbot application using FastAPI, and Google Cloud services. It supports multiple conversation patterns and can be easily extended with new chains.
 
-## Folder Structure
+# Folder Structure
 
 ```plaintext
 .
