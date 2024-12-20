@@ -42,6 +42,8 @@ class SideBar:
         self.st = st
         self.uploaded_files = None
         self.uploaded_folder = None
+        if "bucket_name" not in self.st.session_state:
+            self.st.session_state["bucket_name"] = os.environ.get("BUCKET_NAME", "gs://your-bucket-name")
 
     def init_side_bar(self) -> None:
         """Initialize and render the sidebar components."""
@@ -53,10 +55,9 @@ class SideBar:
             self.should_authenticate_request = self.st.checkbox(
                 label="Authenticate request",
                 value=False,
-                help="If checked, any request to the server will contain an"
-                "Identity token to allow authentication. "
-                "See the Cloud Run documentation to know more about authentication:"
-                "https://cloud.google.com/run/docs/authenticating/service-to-service",
+                help="If checked, any request to the server will contain an Identity token to allow authentication. "
+                     "See the Cloud Run documentation to know more about authentication: "
+                     "https://cloud.google.com/run/docs/authenticating/service-to-service",
             )
             col1, col2, col3 = self.st.columns(3)
             with col1:
@@ -128,11 +129,25 @@ class SideBar:
                         )
 
             self.st.divider()
+
             self.st.header("Upload files from local")
+            # Retrieve previously stored bucket name if available
+            stored_bucket_name = self.st.session_state.session_db.get(
+                "bucket_name", 
+                os.environ.get("BUCKET_NAME", "gs://your-bucket-name")
+            )
+
             bucket_name = self.st.text_input(
                 label="GCS Bucket for upload",
-                value=os.environ.get("BUCKET_NAME", "gs://your-bucket-name"),
+                value=stored_bucket_name,
+                key="bucket_name_input",
             )
+
+            # Save the bucket_name to session state and session_db if changed
+            if bucket_name != stored_bucket_name:
+                self.st.session_state.session_db.set("bucket_name", bucket_name)
+                self.st.session_state["bucket_name"] = bucket_name
+
             if "checkbox_state" not in self.st.session_state:
                 self.st.session_state.checkbox_state = True
 
@@ -142,7 +157,7 @@ class SideBar:
 
             # Add folder upload toggle
             use_folder_upload = self.st.checkbox(
-                "Upload Entire Folder", 
+                "Upload Entire Folder",
                 value=False,
                 help="Upload multiple files from a .zip file"
             )
@@ -170,8 +185,8 @@ class SideBar:
 
             if (self.uploaded_files or self.uploaded_folder) and self.st.session_state.checkbox_state:
                 upload_files_to_gcs(
-                    self.st, 
-                    bucket_name, 
+                    self.st,
+                    bucket_name,
                     self.uploaded_files if self.uploaded_files else [self.uploaded_folder],
                     is_folder=bool(self.uploaded_folder)
                 )
