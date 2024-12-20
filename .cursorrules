@@ -1,0 +1,1 @@
+Every time a diff is made in the codebase, the Cursor Agent should call the agent_tools/create_code_snapshot.py module as a function and update the full code snapshot with the diff

@@ -49,7 +49,7 @@ class SideBar:
         """Initialize and render the sidebar components."""
         with self.st.sidebar:
             self.url_input_field = self.st.text_input(
-                label="Service URL",
+                label="Local URL",
                 value=os.environ.get("SERVICE_URL", DEFAULT_BASE_URL),
             )
             self.should_authenticate_request = self.st.checkbox(
@@ -132,9 +132,8 @@ class SideBar:
 
             self.st.header("Upload files from local")
             # Retrieve previously stored bucket name if available
-            stored_bucket_name = self.st.session_state.session_db.get(
-                "bucket_name", 
-                os.environ.get("BUCKET_NAME", "gs://your-bucket-name")
+            stored_bucket_name = self.st.session_state.get(
+                "bucket_name", os.environ.get("BUCKET_NAME", "gs://your-bucket-name")
             )
 
             bucket_name = self.st.text_input(
@@ -143,9 +142,8 @@ class SideBar:
                 key="bucket_name_input",
             )
 
-            # Save the bucket_name to session state and session_db if changed
+            # Save the bucket_name to session_state if changed
             if bucket_name != stored_bucket_name:
-                self.st.session_state.session_db.set("bucket_name", bucket_name)
                 self.st.session_state["bucket_name"] = bucket_name
 
             if "checkbox_state" not in self.st.session_state:

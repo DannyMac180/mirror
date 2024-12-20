@@ -25,6 +25,8 @@ from kfp.dsl import component, Dataset, Output, Input
         "langchain-google-vertexai",
         "pypdf",
         "pydantic==2.9.2",
+        "pytesseract",
+        "Pillow",
         "markdown"
     ]
 )
@@ -38,6 +40,7 @@ def process_data(
     import json
     import logging
     import uuid
+    import pytesseract
     import vertexai
     from langchain.text_splitter import RecursiveCharacterTextSplitter
     from langchain_community.document_loaders import PyPDFLoader, TextLoader
@@ -45,6 +48,24 @@ def process_data(
     from langchain_core.embeddings import Embeddings
     from langchain_google_vertexai import VertexAIEmbeddings
     from typing import List
+
+    class ImageLoader:
+        """Simple loader for image files using OCR."""
+        def __init__(self, file_path: str):
+            self.file_path = file_path
+
+        def load(self) -> List[Document]:
+            # Here we assume the file_path is local or accessible; if it's a GCS path,
+            # you'd download it first. For now, we assume a local path or a mounted volume.
+            # Additional logic may be needed depending on your environment.
+            with open(self.file_path, "rb") as f:
+                img_content = f.read()
+            # OCR with pytesseract
+            from PIL import Image
+            import io
+            image = Image.open(io.BytesIO(img_content))
+            text = pytesseract.image_to_string(image)
+            return [Document(page_content=text, metadata={"source": self.file_path})]
 
     vertexai.init()
     embedding = VertexAIEmbeddings(model_name=embedding_model)
@@ -55,6 +76,11 @@ def process_data(
             loader = PyPDFLoader(url)
         elif file_type.lower() in ["md", "markdown", "txt"]:
             loader = TextLoader(url)
+        elif file_type.lower() in ["jpg", "jpeg", "png"]:
+            # For images, use the new ImageLoader defined above
+            # Ensure that `url` is a local or accessible file path
+            # If it's a remote URL, download or access it accordingly before passing to ImageLoader.
+            loader = ImageLoader(url)
         else:
             raise ValueError(f"Unsupported file type: {file_type}")
             

@@ -1,0 +1,4030 @@
+
+
+# ======= File: app/README.md =======
+
+# Sample Chatbot Application
+
+This folder implements a chatbot application using FastAPI, and Google Cloud services. It supports multiple conversation patterns and can be easily extended with new chains.
+
+# Folder Structure
+
+```plaintext
+.
+├── server.py           # Main FastAPI server
+├── chain.py            # Default chain implementation
+├── patterns/           # Conversation pattern implementations
+│   ├── custom_rag_qa/
+│   └── langgraph_dummy_agent/
+│   └── agent_builder_search/
+├── utils/              # Utility functions and classes
+└── eval/               # Evaluation tools and data
+```
+
+## Generative AI Application Patterns
+
+### 1. Default Chain
+
+The default chain is a simple conversational bot that produces recipes based on user questions.
+
+### 2. Custom RAG QA
+
+A RAG (Retrieval-Augmented Generation) chain using Python for orchestration and base LangChain components. The chain demonstrates how to create a production-grade application with full control over the orchestration process.
+
+This approach offers maximum flexibility in the orchestration of steps and allows for seamless integration with other SDK frameworks such as [Vertex AI SDK](https://cloud.google.com/vertex-ai/docs/python-sdk/use-vertex-ai-python-sdk) and [LangChain](https://python.langchain.com/), retaining the support to emit `astream_events` [API compatible events](https://python.langchain.com/docs/how_to/streaming/#using-stream-events).
+
+### 3. LangGraph Dummy Agent
+
+A simple agent implemented using LangGraph, a framework for building agent and multi-agent workflows.
+
+### 4. RAG with Vertex AI Agent Builder Search
+
+A RAG (Retrieval-Augmented Generation) pattern using Vertex AI Agent Builder Search for the retrieval of information. It includes a data ingestion pipeline to automate the update of your data. For more details on how to set it up please review the related readme file under the respective folder.
+
+### Switching Between Patterns
+
+To switch between different patterns, modify the import statement in `server.py`.
+
+All chains have the same interface, allowing for seamless swapping without changes to the Streamlit frontend.
+
+## Monitoring and Observability
+
+![monitoring_flow](https://storage.googleapis.com/github-repo/generative-ai/sample-apps/e2e-gen-ai-app-starter-pack/monitoring_flow.png)
+
+### Trace and Log Capture
+
+This application utilizes [OpenTelemetry](https://opentelemetry.io/) and [OpenLLMetry](https://github.com/traceloop/openllmetry) for comprehensive observability, emitting events to Google Cloud Trace and Google Cloud Logging. Every interaction with LangChain and VertexAI is instrumented (see [`server.py`](server.py)), enabling detailed tracing of request flows throughout the application.
+
+Leveraging the [CloudTraceSpanExporter](https://cloud.google.com/python/docs/reference/spanner/latest/opentelemetry-tracing), the application captures and exports tracing data. To address the limitations of Cloud Trace ([256-byte attribute value limit](https://cloud.google.com/trace/docs/quotas#limits_on_spans)) and [Cloud Logging](https://cloud.google.com/logging/quotas) ([256KB log entry size](https://cloud.google.com/logging/quotas)), a custom extension of the CloudTraceSpanExporter is implemented in [`app/utils/tracing.py`](app/utils/tracing.py).
+
+This extension enhances observability by:
+
+- Creating a corresponding Google Cloud Logging entry for every captured event.
+- Automatically storing event data in Google Cloud Storage when the payload exceeds 256KB.
+
+Logged payloads are associated with the original trace, ensuring seamless access from the Cloud Trace console.
+
+### Log Router
+
+Events are forwarded to BigQuery through a [log router](https://cloud.google.com/logging/docs/routing/overview) for long-term storage and analysis. The deployment of the log router is done via Terraform code in [deployment/terraform](../deployment/terraform).
+
+### Looker Studio Dashboard
+
+Once the data is written to BigQuery, it can be used to populate a [Looker Studio dashboard](https://lookerstudio.google.com/c/reporting/fa742264-4b4b-4c56-81e6-a667dd0f853f/page/tEnnC).
+
+This dashboard, offered as a template, provides a starting point for building custom visualizations on the top of the data being captured.
+
+
+# ======= File: app/__init__.py =======
+
+
+
+# ======= File: app/chain.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_google_vertexai import ChatVertexAI
+
+LOCATION = "us-central1"
+LLM = "gemini-2.0-flash-exp"
+
+
+llm = ChatVertexAI(
+    model_name=LLM,
+    location=LOCATION,
+    temperature=0,
+    max_output_tokens=1024,
+)
+
+template = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a wise and helpful guide for the user. Your responses should be supportive, engaging, "
+            "and insightful. You should be able to answer any question the user has, and provide helpful "
+            "advice and suggestions. The idea is that you are a reflective mirror for the user, and you "
+            "are attempting to help the user understand themselves better.",
+        ),
+        MessagesPlaceholder(variable_name="messages"),
+    ]
+)
+
+chain = template | llm
+
+
+# ======= File: app/server.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# pylint: disable=W0718, C0411
+# ruff: noqa: I001
+
+import json
+import logging
+import os
+from typing import AsyncGenerator
+import uuid
+
+from app.chain import chain
+from app.utils.input_types import Feedback, Input, InputChat, default_serialization
+from app.utils.output_types import EndEvent, Event
+from app.utils.tracing import CloudTraceLoggingSpanExporter
+from fastapi import FastAPI
+from fastapi.responses import RedirectResponse, StreamingResponse
+from google.cloud import logging as google_cloud_logging
+from traceloop.sdk import Instruments, Traceloop
+
+# Default chain
+# from app.chain import chain
+
+# Or choose one of the following pattern chains to test by uncommenting it:
+
+# Custom RAG QA
+# from app.patterns.custom_rag_qa.chain import chain
+
+# LangGraph dummy agent
+# from app.patterns.langgraph_dummy_agent.chain import chain
+
+# Or explore other patterns in the 'app/patterns' folder
+
+# The events that are supported by the UI Frontend
+SUPPORTED_EVENTS = [
+    "on_tool_start",
+    "on_tool_end",
+    "on_retriever_start",
+    "on_retriever_end",
+    "on_chat_model_stream",
+]
+
+# Initialize FastAPI app and logging
+app = FastAPI()
+logging_client = google_cloud_logging.Client()
+logger = logging_client.logger(__name__)
+
+# Initialize Traceloop
+try:
+    Traceloop.init(
+        app_name="Sample Chatbot Application",
+        disable_batch=False,
+        exporter=CloudTraceLoggingSpanExporter(),
+        instruments={Instruments.VERTEXAI, Instruments.LANGCHAIN},
+    )
+except Exception as e:
+    logging.error("Failed to initialize Traceloop: %s", e)
+
+
+async def stream_event_response(input_chat: InputChat) -> AsyncGenerator[str, None]:
+    """Stream events in response to an input chat."""
+    run_id = uuid.uuid4()
+    input_dict = input_chat.model_dump()
+
+    Traceloop.set_association_properties(
+        {
+            "log_type": "tracing",
+            "run_id": str(run_id),
+            "user_id": input_dict["user_id"],
+            "session_id": input_dict["session_id"],
+            "commit_sha": os.environ.get("COMMIT_SHA", "None"),
+        }
+    )
+
+    yield json.dumps(
+        Event(event="metadata", data={"run_id": str(run_id)}),
+        default=default_serialization,
+    ) + "\n"
+
+    async for data in chain.astream_events(input_dict, version="v2"):
+        if data["event"] in SUPPORTED_EVENTS:
+            yield json.dumps(data, default=default_serialization) + "\n"
+
+    yield json.dumps(EndEvent(), default=default_serialization) + "\n"
+
+
+# Routes
+@app.get("/")
+async def redirect_root_to_docs() -> RedirectResponse:
+    """Redirect the root URL to the API documentation."""
+    return RedirectResponse("/docs")
+
+
+@app.post("/feedback")
+async def collect_feedback(feedback_dict: Feedback) -> None:
+    """Collect and log feedback."""
+    logger.log_struct(feedback_dict.model_dump(), severity="INFO")
+
+
+@app.post("/stream_events")
+async def stream_chat_events(request: Input) -> StreamingResponse:
+    """Stream chat events in response to an input request."""
+    return StreamingResponse(
+        stream_event_response(input_chat=request.input), media_type="text/event-stream"
+    )
+
+
+# Main execution
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+# ======= File: app/patterns/langgraph_dummy_agent/chain.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# mypy: disable-error-code="unused-ignore, union-attr"
+
+from typing import Dict
+
+from langchain_core.messages import BaseMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
+from langchain_google_vertexai import ChatVertexAI
+from langgraph.graph import END, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode
+
+LOCATION = "us-central1"
+LLM = "gemini-1.5-pro-002"
+
+
+# 1. Define tools
+@tool
+def search(query: str) -> str:
+    """Simulates a web search. Use it get information on weather"""
+    if "sf" in query.lower() or "san francisco" in query.lower():
+        return "It's 60 degrees and foggy."
+    return "It's 90 degrees and sunny."
+
+
+tools = [search]
+
+# 2. Set up the language model
+llm = ChatVertexAI(
+    model=LLM, location=LOCATION, temperature=0, max_tokens=1024, streaming=True
+).bind_tools(tools)
+
+
+# 3. Define workflow components
+def should_continue(state: MessagesState) -> str:
+    """Determines whether to use tools or end the conversation."""
+    last_message = state["messages"][-1]
+    return "tools" if last_message.tool_calls else END
+
+
+def call_model(state: MessagesState, config: RunnableConfig) -> Dict[str, BaseMessage]:
+    """Calls the language model and returns the response."""
+    system_message = "You are a helpful AI assistant."
+    messages_with_system = [{"type": "system", "content": system_message}] + state[
+        "messages"
+    ]
+    # Forward the RunnableConfig object to ensure the agent is capable of streaming the response.
+    response = llm.invoke(messages_with_system, config)
+    return {"messages": response}
+
+
+# 4. Create the workflow graph
+workflow = StateGraph(MessagesState)
+workflow.add_node("agent", call_model)
+workflow.add_node("tools", ToolNode(tools))
+workflow.set_entry_point("agent")
+
+# 5. Define graph edges
+workflow.add_conditional_edges("agent", should_continue)
+workflow.add_edge("tools", "agent")
+
+# 6. Compile the workflow
+chain = workflow.compile()
+
+
+# ======= File: app/patterns/agentic_rag_vertex_ai_search/README.md =======
+
+# Agentic RAG with Vertex AI Search
+
+This pattern enhances the Gen AI App Starter Pack with a production-ready data ingestion pipeline, enriching your Retrieval Augmented Generation (RAG) applications. Using Vertex AI Search's state-of-the-art search capabilities, you can ingest, process, and embed custom data, improving the relevance and context of your generated responses.
+
+The pattern provides the infrastructure to create a Vertex AI Pipeline with your custom code. Because it's built on Vertex AI Pipelines, you benefit from features like scheduled runs, recurring executions, and on-demand triggers. For processing terabyte-scale data, we recommend combining Vertex AI Pipelines with data analytics tools like BigQuery or Dataflow.
+
+## Architecture
+
+The pattern implements the following architecture:
+
+![architecture diagram](https://storage.googleapis.com/github-repo/generative-ai/sample-apps/e2e-gen-ai-app-starter-pack/agentic_rag_vertex_ai_search_architecture.png)
+The main addition to the base pattern is the addition of the ingestion components.
+
+### Key Features
+
+- **Vertex AI Search Integration:** Utilizes Vertex AI Search for efficient data storage and retrieval.
+- **Automated Data Ingestion Pipeline:** Automates the process of ingesting data from input sources.
+- **Custom Embeddings:** Generates embeddings using Vertex AI Embeddings and incorporates them into your data for enhanced semantic search.
+- **Terraform Deployment:** Ingestion pipeline is instantiated with Terraform alongside the rest of the infrastructure of the starter pack.
+- **Cloud Build Integration:** Deployment of ingestion pipelines is added to the CD pipelines of the starter pack.
+- **Customizable Code:** Easily adapt and customize the code to fit your specific application needs and data sources.
+
+From an infrastructure point of view, a _Vertex AI Agent Builder Datastore_ and _Search App_ are being initialised in both staging and prod environments. You can learn more about these [here](https://cloud.google.com/generative-ai-app-builder/docs/enterprise-search-introduction).
+
+When a new build is triggered through a commit to the main branch, in addition to updating the backend application, the data ingestion pipeline is also updated.
+
+The data ingestion is orchestrated through a Vertex AI [Pipeline](https://cloud.google.com/vertex-ai/docs/pipelines/introduction) which in its simplest form comprises of a two processing step.
+The pipeline reads data from a source (e.g., a PDF document) located at a configurable location. The data is then divided into smaller chunks, processed, and ingested into the Vertex AI Agent Builder Datastore. Upon ingestion completion, the connected Search App is automatically updated with the new data without any downtime.
+
+Please note that the ingestion in the example is set to run automatically once per week. You may change the frequency of the update or the triggering mechanism altogether to match your needs. Look into the `data_processing/data_processing_pipeline/pipeline.py` and `deployment/cd/deploy-to-prod.yaml` files as the starting point for these changes.
+
+## Getting Started
+
+1. **Prepare the pattern:** First, prepare the pattern for data ingestion. In a clean instance of the starter pack, navigate to the `agentic_rag_vertex_ai_search` directory and execute the following command:
+
+   ```bash
+   python app/patterns/agentic_rag_vertex_ai_search/pattern_setup/prepare_pattern.py
+   ```
+
+2. **Setup Dev Terraform:** Follow the instructions in the parent [deployment/README.md - Dev Deployment section](../../../deployment/README.md#dev-deployment) to set up the development environment using Terraform. This will deploy a datastore and configure the necessary permissions in your development project.
+
+   Refer to the [Terraform Variables section](#terraform-variables) to learn about the additional variables required for this pattern.
+
+3. **Test the Data Ingestion Pipeline:**
+
+   After successfully deploying the Terraform infrastructure, you can test the data ingestion pipeline. This pipeline is responsible for loading, chunking, embedding, and importing your data into the Vertex AI Search datastore.
+
+   > Note: The first pipeline execution may take additional time as your project is being configured to use Vertex AI Pipelines.
+
+   **a. Navigate to the Data Processing Directory:**
+
+   Change your working directory to the location of the data processing scripts:
+
+   ```bash
+   cd data_processing
+   ```
+
+   **b. Install Dependencies:**
+
+   Ensure you have the necessary Python dependencies installed by running:
+
+   ```bash
+   poetry install
+   ```
+
+   **c. Execute the Pipeline:**
+
+   Use the following command to execute the data ingestion pipeline. Replace the placeholder values with your actual project details:
+
+   ```bash
+   PROJECT_ID="YOUR_PROJECT_ID"
+   REGION="us-central1"
+   REGION_VERTEX_AI_SEARCH="us"
+   poetry run python data_processing_pipeline/submit_pipeline.py \
+       --project-id=$PROJECT_ID \
+       --region=$REGION \
+       --region-vertex-ai-search=$REGION_VERTEX_AI_SEARCH \
+       --data-store-id="sample-datastore" \
+       --service-account="vertexai-pipelines-sa@$PROJECT_ID.iam.gserviceaccount.com" \
+       --pipeline-root="gs://$PROJECT_ID-pipeline-artifacts" \
+       --pipeline-name="data-ingestion-pipeline"
+   ```
+
+   **Explanation of Parameters:**
+
+   - `--project-id`: Your Google Cloud Project ID.
+   - `--region`: The region where Vertex AI Pipelines will be executed (e.g., `us-central1`).
+   - `--region-vertex-ai-search`: The region for Vertex AI Search operations (e.g., `us` or `eu`).
+   - `--data-store-id`: The ID of your Vertex AI Search data store.
+   - `--service-account`: The service account email used for pipeline execution.
+   - `--pipeline-root`: The GCS bucket name for storing pipeline artifacts.
+   - `--pipeline-name`: A display name for your pipeline.
+   - `--schedule-only`: _(Optional)_ If true, only schedules the pipeline without immediate execution. Must be used with `--cron-schedule`.
+   - `--cron-schedule`: _(Optional)_ A cron schedule to run the pipeline periodically (e.g., `"0 9 * * 1"` for every Monday at 9 AM UTC).
+
+   **d. Pipeline Execution Behavior:**
+
+   The pipeline executes immediately. Use the `--schedule-only` flag with a `cron_schedule` to only schedule the pipeline without immediate execution. If no schedule exists, one is created. If a schedule exists, its cron expression is updated.
+
+   **e. Monitoring Pipeline Execution:**
+
+   The pipeline will output its configuration and execution status to the console. For detailed monitoring, you can use the Vertex AI Pipeline dashboard in your Google Cloud Console. This dashboard provides insights into the pipeline's progress, logs, and any potential issues.
+
+4. **Test the Application in the Playground**
+
+   You are now ready to test your RAG application with Vertex AI Search locally.
+   To do that you can follow the instructions in the [root readme](../../../README.md#installation).
+
+   1. Navigate to the root folder & install the required dependencies:
+
+      ```bash
+      poetry install --with streamlit,jupyter
+      ```
+
+   2. Configure your Google Cloud environment:
+
+      ```bash
+      export PROJECT_ID="YOUR_PROJECT_ID"
+      gcloud config set project $PROJECT_ID
+      gcloud auth application-default login
+      gcloud auth application-default set-quota-project $PROJECT_ID
+      ```
+
+   3. Check your [app/chain.py](../../../app/chain.py) file to understand its content and verify the datastore ID and region are configured properly.
+
+   4. Launch the playground:
+
+      ```bash
+      make playground
+      ```
+
+   5. Test your application!
+
+   > **Note:** If you encounter the error `"google.api_core.exceptions.InvalidArgument: 400 The embedding field path: embedding not found in schema"` after the first ingestion, please wait a few minutes and try again.
+
+5. **Setup Staging and Production:** Once you've validated the setup in your development environment, proceed to set up the Terraform infrastructure for your staging and production environments. Follow the instructions provided in the [deployment/README.md](../../../deployment/README.md) to configure and deploy the necessary resources.
+
+   This ensures that your data ingestion pipeline is integrated into your CI/CD workflow. Once the setup is complete, any commit to the main branch will trigger the pipeline, updating your Vertex AI Search application with the latest data, and deploying the updated application and tests.
+
+   Your CI/CD pipeline is now configured - any new commits will trigger the data ingestion, testing and deployment process automatically.
+
+## Terraform Variables
+
+This pattern introduces the following additional Terraform variables:
+
+| Variable                    | Description                                                                        | Default Value           |
+| --------------------------- | ---------------------------------------------------------------------------------- | ----------------------- |
+| `search_engine_name`        | The name of the Vertex AI Search engine.                                           | `sample-search-engine`  |
+| `datastore_name`            | The name of the Vertex AI Agent Builder Datastore.                                 | `sample-datastore`      |
+| `vertexai_pipeline_sa_name` | The name of the service account used for Vertex AI Pipelines.                      | `vertexai-pipelines-sa` |
+| `region_vertex_ai_search`   | The region for the Vertex AI Search engine. Can be one of "global", "us", or "eu". | `us`                    |
+| `pipeline_cron_schedule`    | A cron expression defining the schedule for automated data ingestion.              | `0 0 * * 0`             |
+
+These variables are defined in the `deployment/terraform/variables.tf` and `deployment/terraform/dev/variables.tf` files and can be customized in your `deployment/terraform/vars/env.tfvars` and `deployment/terraform/dev/vars/env.tfvars` files respectively.
+
+
+# ======= File: app/patterns/agentic_rag_vertex_ai_search/pattern_setup/prepare_pattern.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import shutil
+from pathlib import Path
+
+
+def replace_in_file(
+    file_path: Path, search_str: str, replacement_file_path: Path
+) -> None:
+    """Replace a string in a file with contents from another file."""
+    with open(replacement_file_path, "r") as f:
+        replacement_content = f.read()
+
+    with open(file_path, "r") as f:
+        content = f.read()
+
+    with open(file_path, "w") as f:
+        f.write(content.replace(search_str, replacement_content))
+
+
+def append_file_contents(source_file: Path, target_file: Path) -> None:
+    """Append contents of one file to another."""
+    with open(source_file, "r") as source, open(target_file, "a") as target:
+        target.write(source.read())
+
+
+def main() -> None:
+    """Set up the agentic RAG pattern by copying and updating Terraform files.
+
+    Makes a backup of the deployment folder, then updates various Terraform files
+    with pattern-specific configurations by replacing content and appending updates.
+    """
+    base_path = Path(
+        "app/patterns/agentic_rag_vertex_ai_search/pattern_setup/resources_to_copy"
+    )
+    terraform_path = base_path / "deployment/terraform"
+    deployment_path = Path("deployment/terraform")
+    # Make backup copy of deployment folder
+    deployment_backup_path = Path(".deployment_backup")
+    if deployment_backup_path.exists():
+        shutil.rmtree(deployment_backup_path)
+    print(f"Creating backup of deployment folder at '{deployment_backup_path}'")
+    shutil.copytree("deployment", deployment_backup_path, dirs_exist_ok=True)
+
+    # Replace content in build_triggers.tf
+    build_triggers_replacements = {
+        "# Your other CD Pipeline substitutions": terraform_path
+        / "substitute__cd_pipeline_triggers.tf_updates",
+        "# Your other Deploy to Prod Pipeline substitutions": terraform_path
+        / "substitute__deploy_to_prod_pipeline_triggers.tf_updates",
+    }
+
+    for search_str, replacement_file in build_triggers_replacements.items():
+        replace_in_file(
+            deployment_path / "build_triggers.tf", search_str, replacement_file
+        )
+
+    # Append contents to various tf files
+    tf_files_to_append = {
+        "iam.tf": "append__iam.tf_updates",
+        "service_accounts.tf": "append__service_accounts.tf_updates",
+        "storage.tf": "append__storage.tf_updates",
+        "variables.tf": "append__variables.tf_updates",
+    }
+
+    for target_file, source_file in tf_files_to_append.items():
+        append_file_contents(
+            terraform_path / source_file, deployment_path / target_file
+        )
+
+    # Append to env.tfvars
+    append_file_contents(
+        terraform_path / "vars/append__env.tfvars_updates",
+        deployment_path / "vars/env.tfvars",
+    )
+
+    # Copy files
+    shutil.copy(
+        terraform_path / "data_store.tf_updates", deployment_path / "data_store.tf"
+    )
+    shutil.copytree(base_path / "deployment/cd", "deployment/cd", dirs_exist_ok=True)
+    # Additional operations on dev folder
+    # Define files to append in dev directory
+    dev_files_to_append = {
+        "dev/vars/env.tfvars": "dev/vars/append__env.tfvars_updates",
+        "dev/variables.tf": "dev/append__variables.tf_updates",
+        "dev/iam.tf": "dev/append__iam.tf_updates",
+        "dev/service_accounts.tf": "dev/append__service_accounts.tf_updates",
+        "dev/storage.tf": "dev/append__storage.tf_updates",
+    }
+
+    # Append contents to each file
+    for target_file, source_file in dev_files_to_append.items():
+        append_file_contents(
+            terraform_path / source_file, deployment_path / target_file
+        )
+    shutil.copy(
+        terraform_path / "dev/data_store.tf_updates",
+        deployment_path / "dev/data_store.tf",
+    )
+
+    # Setup data ingestion
+    data_processing_path = Path("data_processing")
+    data_processing_path.mkdir(exist_ok=True)
+    shutil.copytree(
+        base_path / "data_processing", data_processing_path, dirs_exist_ok=True
+    )
+    for filename in ("chain.py", "retrievers.py", "templates.py"):
+        shutil.copy(base_path / "app" / filename, Path("app") / filename)
+
+    # Setup tests
+    test_integration_path = Path("tests/integration")
+    shutil.copy(
+        base_path / "tests/integration/test_chain.py",
+        test_integration_path / "test_chain.py",
+    )
+
+    print("Successfully copied pattern files")
+
+
+if __name__ == "__main__":
+    main()
+
+
+# ======= File: app/patterns/agentic_rag_vertex_ai_search/pattern_setup/resources_to_copy/app/chain.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# pylint: disable=E0611
+
+import os
+from typing import Dict, List
+
+import google
+import vertexai
+
+from langchain_core.documents import Document
+from langchain_core.messages import BaseMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
+from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
+from langgraph.graph import END, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode
+from app.templates import rag_template, format_docs, inspect_conversation_template
+from app.retrievers import get_retriever, get_compressor
+
+EMBEDDING_MODEL = "text-embedding-004"
+LLM_MODEL = "gemini-1.5-flash-002"
+TOP_K = 5
+
+VERTEX_AI_LOCATION = os.getenv("REGION", "us-central1")
+AGENT_BUILDER_LOCATION = os.getenv("AGENT_BUILDER_LOCATION", "us")
+DATA_STORE_ID = os.getenv("DATA_STORE_ID", "sample-datastore")
+
+# Initialize Google Cloud and Vertex AI
+credentials, project_id = google.auth.default()
+vertexai.init(project=project_id)
+
+embedding = VertexAIEmbeddings(model_name=EMBEDDING_MODEL, location=VERTEX_AI_LOCATION)
+
+retriever = get_retriever(
+    project_id=project_id,
+    data_store_id=DATA_STORE_ID,
+    agent_builder_location=AGENT_BUILDER_LOCATION,
+    embedding=embedding,
+)
+compressor = get_compressor(project_id=project_id)
+
+
+@tool(response_format="content_and_artifact")
+def retrieve_docs(query: str) -> tuple[str, List[Document]]:
+    """
+    Useful for retrieving relevant documents based on a query.
+    Use this when you need additional information to answer a question.
+
+    Args:
+        query (str): The user's question or search query.
+
+    Returns:
+        List[Document]: A list of the top-ranked Document objects, limited to TOP_K (5) results.
+    """
+    # Use the retriever to fetch relevant documents based on the query
+    retrieved_docs = retriever.invoke(query)
+    # Re-rank docs with Vertex AI Rank for better relevance
+    ranked_docs = compressor.compress_documents(documents=retrieved_docs, query=query)
+    # Format ranked documents into a consistent structure for LLM consumption
+    formatted_docs = format_docs.format(docs=ranked_docs)
+    return (formatted_docs, ranked_docs)
+
+
+@tool
+def should_continue() -> None:
+    """
+    Use this tool if you determine that you have enough context to respond to the questions of the user.
+    """
+    return None
+
+
+tools = [retrieve_docs, should_continue]
+
+llm = ChatVertexAI(model=LLM_MODEL, temperature=0, max_tokens=1024, streaming=True)
+
+# Set up conversation inspector
+inspect_conversation = inspect_conversation_template | llm.bind_tools(
+    tools, tool_choice="any"
+)
+
+# Set up response chain
+response_chain = rag_template | llm
+
+
+def inspect_conversation_node(
+    state: MessagesState, config: RunnableConfig
+) -> Dict[str, BaseMessage]:
+    """Inspects the conversation state and returns the next message using the conversation inspector."""
+    response = inspect_conversation.invoke(state, config)
+    return {"messages": response}
+
+
+def generate_node(
+    state: MessagesState, config: RunnableConfig
+) -> Dict[str, BaseMessage]:
+    """Generates a response using the RAG template and returns it as a message."""
+    response = response_chain.invoke(state, config)
+    return {"messages": response}
+
+
+# Flow:
+# 1. Start with agent node that inspects conversation using inspect_conversation_node
+# 2. Agent node connects to tools node which can either:
+#    - Retrieve relevant docs using retrieve_docs tool
+#    - End tool usage with should_continue tool
+# 3. Tools node connects to generate node which produces final response
+# 4. Generate node connects to END to complete the workflow
+
+workflow = StateGraph(MessagesState)
+workflow.add_node("agent", inspect_conversation_node)
+workflow.add_node("generate", generate_node)
+workflow.set_entry_point("agent")
+
+workflow.add_node(
+    "tools",
+    ToolNode(
+        tools=tools,
+        # With False, tool errors won't be caught by LangGraph
+        handle_tool_errors=False,
+    ),
+)
+workflow.add_edge("agent", "tools")
+workflow.add_edge("tools", "generate")
+
+workflow.add_edge("generate", END)
+
+chain = workflow.compile()
+
+
+# ======= File: app/patterns/agentic_rag_vertex_ai_search/pattern_setup/resources_to_copy/app/retrievers.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+from unittest.mock import MagicMock
+from langchain_google_community import VertexAISearchRetriever
+from langchain_google_community.vertex_rank import VertexAIRank
+from langchain_google_vertexai import VertexAIEmbeddings
+
+
+def get_retriever(
+    project_id: str,
+    data_store_id: str,
+    agent_builder_location: str,
+    embedding: VertexAIEmbeddings,
+) -> VertexAISearchRetriever:
+    """
+    Creates and returns an instance of the retriever service.
+
+    Uses mock service if the INTEGRATION_TEST environment variable is set to "TRUE",
+    otherwise initializes real Vertex AI retriever.
+    """
+    if os.getenv("INTEGRATION_TEST") == "TRUE":
+        retriever = MagicMock()
+        retriever.invoke = lambda x: []
+        return retriever
+
+    return VertexAISearchRetriever(
+        project_id=project_id,
+        data_store_id=data_store_id,
+        location_id=agent_builder_location,
+        engine_data_type=1,
+        # The following parameters are used when you want to search
+        # using custom embeddings in Agent Builder.
+        # The ratio is set to 0.5 by default to use a mix of custom
+        # embeddings but you can adapt the ratio as you need.
+        custom_embedding_ratio=0.5,
+        custom_embedding=embedding,
+        custom_embedding_field_path="embedding",
+        # Extracting 20 documents before re-rank.
+        max_documents=20,
+    )
+
+
+def get_compressor(project_id: str) -> VertexAIRank:
+    """
+    Creates and returns an instance of the compressor service.
+
+    Uses mock service if the INTEGRATION_TEST environment variable is set to "TRUE",
+    otherwise initializes real Vertex AI compressor.
+    """
+    if os.getenv("INTEGRATION_TEST") == "TRUE":
+        compressor = MagicMock()
+        compressor.compress_documents = lambda documents, query: []
+        return compressor
+
+    return VertexAIRank(
+        project_id=project_id,
+        location_id="global",
+        ranking_config="default_ranking_config",
+        title_field="id",
+        top_n=5,
+    )
+
+
+# ======= File: app/patterns/agentic_rag_vertex_ai_search/pattern_setup/resources_to_copy/app/templates.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from langchain_core.prompts import (
+    PromptTemplate,
+    ChatPromptTemplate,
+    MessagesPlaceholder,
+)
+
+format_docs = PromptTemplate.from_template(
+    """## Context provided:
+{% for doc in docs%}
+<Document {{ loop.index0 }}>
+{{ doc.page_content | safe }}
+</Document {{ loop.index0 }}>
+{% endfor %}
+""",
+    template_format="jinja2",
+)
+
+inspect_conversation_template = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are an AI assistant tasked with analyzing the conversation"""
+            """ and determining the best course of action.""",
+        ),
+        MessagesPlaceholder(variable_name="messages"),
+    ]
+)
+
+rag_template = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are an AI assistant for question-answering tasks."""
+            """ Answer to the best of your ability using the context provided."""
+            """ Leverage the Tools you are provided to answer questions.""",
+        ),
+        MessagesPlaceholder(variable_name="messages"),
+    ]
+)
+
+
+# ======= File: app/patterns/agentic_rag_vertex_ai_search/pattern_setup/resources_to_copy/tests/integration/test_chain.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# pylint: disable=R0801,C0415
+from unittest.mock import patch
+import pytest
+
+from app.utils.output_types import OnToolEndEvent
+from langchain_core.documents import Document
+from langchain_core.messages import AIMessageChunk, HumanMessage
+
+CHAIN_NAME = "Agentic RAG Vertex AI Search agent"
+
+
+@pytest.mark.asyncio
+async def test_agentic_rag_vertex_ai_search_astream_events() -> None:
+    """
+    Integration testing example for the Agentic RAG Vertex AI Search agent chain. We assert that the chain returns
+    events, containing AIMessageChunks and tool usage events for document retrieval.
+    """
+
+    # We mock the Vector DBs call to avoid to create this dependency during integration tests
+    # Patch the retrieve_docs function to return our mock document
+    with patch("app.chain.retrieve_docs.func") as mock_retrieve:
+        from app.chain import chain
+
+        # Mock document to be returned by retrieve_docs
+        mock_doc = Document(
+            page_content="Test document content", metadata={"source": "test_source"}
+        )
+        mock_retrieve.return_value = ("dummy content", [mock_doc])
+
+        user_message = HumanMessage("What is MLOps?")
+        input_dict = {"messages": [user_message]}
+
+        events = [
+            event async for event in chain.astream_events(input_dict, version="v2")
+        ]
+
+        assert len(events) > 1, (
+            f"Expected multiple events for {CHAIN_NAME} chain, " f"got {len(events)}"
+        )
+        on_tool_end_events = [
+            event for event in events if event["event"] == "on_tool_end"
+        ]
+
+        assert len(on_tool_end_events) == 1, (
+            f"Expected exactly one on_tool_end event for {CHAIN_NAME} chain, "
+            f"got {len(on_tool_end_events)}"
+        )
+        assert isinstance(
+            OnToolEndEvent.model_validate(on_tool_end_events[0]), OnToolEndEvent
+        )
+
+        on_chain_stream_events = [
+            event for event in events if event["event"] == "on_chat_model_stream"
+        ]
+
+        assert on_chain_stream_events, (
+            f"Expected at least one on_chat_model_stream event"
+            f" for {CHAIN_NAME} chain"
+        )
+
+        for event in on_chain_stream_events:
+            assert AIMessageChunk.model_validate(
+                event["data"]["chunk"]
+            ), f"Invalid AIMessageChunk for {CHAIN_NAME} chain: {event['data']['chunk']}"
+
+
+# ======= File: app/patterns/agentic_rag_vertex_ai_search/pattern_setup/resources_to_copy/data_processing/README.md =======
+
+# Ingestion Pipeline
+
+This pipeline is designed to automate the ingestion of data into Vertex AI Search (Agent Builder Search) for use in Retrieval Augmented Generation (RAG) applications. It handles the complete workflow of loading documents, chunking them into appropriate segments, generating embeddings using Vertex AI Embeddings, and importing the processed data into your Vertex AI Search datastore.
+
+The pipeline can be triggered as a one-time execution for initial data loading or scheduled to run periodically using a cron schedule for keeping your search index up-to-date. It leverages Vertex AI Pipelines for orchestration & monitoring.
+
+For detailed step-by-step instructions on setting up and running this pipeline, please refer to the [Agentic RAG with Vertex AI Search Pattern Guide](../app/patterns/agentic_rag_vertex_ai_search/README.md).
+
+
+# ======= File: app/patterns/agentic_rag_vertex_ai_search/pattern_setup/resources_to_copy/data_processing/pyproject.toml =======
+
+[tool.poetry]
+name = "data-processing-pipeline"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <your@email.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+kfp = "^2.10.1"
+google-cloud-aiplatform = "^1.72.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+
+# ======= File: app/patterns/agentic_rag_vertex_ai_search/pattern_setup/resources_to_copy/data_processing/data_processing_pipeline/components.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# pylint: disable=C0415,R0917,R0913,R0914
+
+from typing import Optional
+from kfp.dsl import component, Dataset, Output, Input
+
+
+@component(
+    packages_to_install=[
+        "langchain",
+        "langchain-community",
+        "vertexai",
+        "langchain-google-vertexai",
+        "pypdf",
+        "pydantic==2.9.2",
+        "markdown"
+    ]
+)
+def process_data(
+    output_files: Output[Dataset],
+    embedding_model: str,
+    file_url: str,
+    file_type: str = "pdf",
+) -> None:
+    """Processes document by splitting into chunks and generating embeddings."""
+    import json
+    import logging
+    import uuid
+    import vertexai
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    from langchain_community.document_loaders import PyPDFLoader, TextLoader
+    from langchain_core.documents import Document
+    from langchain_core.embeddings import Embeddings
+    from langchain_google_vertexai import VertexAIEmbeddings
+    from typing import List
+
+    vertexai.init()
+    embedding = VertexAIEmbeddings(model_name=embedding_model)
+
+    def pre_process_data(url: str, file_type: str) -> List[Document]:
+        """Load and split documents from a given URL."""
+        if file_type.lower() == "pdf":
+            loader = PyPDFLoader(url)
+        elif file_type.lower() in ["md", "markdown", "txt"]:
+            loader = TextLoader(url)
+        else:
+            raise ValueError(f"Unsupported file type: {file_type}")
+            
+        documents = loader.load()
+
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=200
+        )
+        doc_splits = text_splitter.split_documents(documents)
+        for document in doc_splits:
+            document.metadata["title"] = file_url
+            document.metadata["id"] = str(uuid.uuid4())
+
+        return doc_splits
+
+    def add_embeddings(docs: List[Document], embedding: Embeddings) -> List[Document]:
+        """Adds embeddings to a list of documents using the provided embedding model."""
+        embeddings = embedding.embed_documents(
+            [
+                f"{document.metadata['title']}\n{document.page_content}"
+                for document in docs
+            ]
+        )
+
+        documents_with_embeddings = []
+
+        for index, current_document in enumerate(docs):
+            current_document.metadata["embedding"] = embeddings[index]
+            documents_with_embeddings.append(current_document)
+
+        return documents_with_embeddings
+
+    def convert_docs_to_jsonl(docs: List[Document], file_path: str) -> None:
+        """Converts an array of documents to a jsonl file and stores it in GCS.
+
+        Args:
+            docs: An array of documents, where each document is a dictionary.
+        """
+        with open(file_path, "w") as f:
+            for doc in docs:
+                json_data = doc.metadata
+                json_data["content"] = doc.page_content
+                dictionary = {
+                    "id": doc.metadata["id"],
+                    "json_data": json.dumps(json_data),
+                }
+                f.write(json.dumps(dictionary) + "\n")
+
+    logging.info("Starting document pre-processing...")
+    docs = pre_process_data(file_url, file_type)
+    logging.info(f"Pre-processed {len(docs)} document chunks")
+
+    logging.info("Generating embeddings...")
+    docs = add_embeddings(docs, embedding)
+    logging.info("Embeddings generated successfully")
+
+    logging.info("Converting documents to JSONL format...")
+    output_files.path = output_files.path + ".json"
+    convert_docs_to_jsonl(docs, output_files.path)
+    logging.info("JSONL conversion complete")
+
+
+@component(
+    packages_to_install=[
+        "google-cloud-discoveryengine",
+    ],
+)
+def ingest_data_in_datastore(
+    project_id: str,
+    region_vertex_ai_search: str,
+    input_files: Input[Dataset],
+    data_store_id: str,
+    embedding_dimension: int = 768,
+    embedding_column: str = "embedding",
+) -> None:
+    """Process and ingest documents into Vertex AI Search datastore.
+
+    Args:
+        project_id: Google Cloud project ID
+        region_vertex_ai_search: Region for Vertex AI Search
+        input_files: Input dataset containing documents
+        data_store_id: ID of target datastore
+        embedding_column: Name of embedding column in schema
+    """
+    import json
+    import logging
+    from google.api_core.client_options import ClientOptions
+    from google.cloud import discoveryengine
+
+    def update_schema_as_json(
+        original_schema: str,
+        embedding_dimension: int,
+        field_name: Optional[str] = None,
+    ) -> str:
+        """Update datastore schema JSON to include embedding field.
+
+        Args:
+            original_schema: Original schema JSON string
+            field_name: Name of embedding field to add
+
+        Returns:
+            Updated schema JSON string
+        """
+        original_schema_dict = json.loads(original_schema)
+
+        if original_schema_dict.get("properties") is None:
+            original_schema_dict["properties"] = {}
+
+        if field_name:
+            field_schema = {
+                "type": "array",
+                "keyPropertyMapping": "embedding_vector",
+                "dimension": embedding_dimension,
+                "items": {"type": "number"},
+            }
+            original_schema_dict["properties"][field_name] = field_schema
+
+        return json.dumps(original_schema_dict)
+
+    def update_data_store_schema(
+        project_id: str,
+        location: str,
+        data_store_id: str,
+        field_name: Optional[str] = None,
+        client_options: Optional[ClientOptions] = None,
+    ) -> None:
+        """Update datastore schema to include embedding field.
+
+        Args:
+            project_id: Google Cloud project ID
+            location: Google Cloud location
+            data_store_id: Target datastore ID
+            embedding_column: Name of embedding column
+            client_options: Client options for API
+        """
+        schema_client = discoveryengine.SchemaServiceClient(
+            client_options=client_options
+        )
+        collection = "default_collection"
+
+        name = f"projects/{project_id}/locations/{location}/collections/{collection}/dataStores/{data_store_id}/schemas/default_schema"
+
+        schema = schema_client.get_schema(
+            request=discoveryengine.GetSchemaRequest(name=name)
+        )
+        new_schema_json = update_schema_as_json(
+            original_schema=schema.json_schema,
+            embedding_dimension=embedding_dimension,
+            field_name=field_name,
+        )
+        new_schema = discoveryengine.Schema(json_schema=new_schema_json, name=name)
+
+        operation = schema_client.update_schema(
+            request=discoveryengine.UpdateSchemaRequest(
+                schema=new_schema, allow_missing=True
+            )
+        )
+        logging.info(f"Waiting for schema update operation: {operation.operation.name}")
+        operation.result()
+
+    def add_data_in_store(
+        project_id: str,
+        location: str,
+        data_store_id: str,
+        input_files_uri: str,
+        client_options: Optional[ClientOptions] = None,
+    ) -> None:
+        """Import documents into datastore.
+
+        Args:
+            project_id: Google Cloud project ID
+            location: Google Cloud location
+            data_store_id: Target datastore ID
+            input_files_uri: URI of input files
+            client_options: Client options for API
+        """
+        client = discoveryengine.DocumentServiceClient(client_options=client_options)
+
+        parent = client.branch_path(
+            project=project_id,
+            location=location,
+            data_store=data_store_id,
+            branch="default_branch",
+        )
+
+        request = discoveryengine.ImportDocumentsRequest(
+            parent=parent,
+            gcs_source=discoveryengine.GcsSource(
+                input_uris=[input_files_uri],
+                data_schema="document",
+            ),
+            reconciliation_mode=discoveryengine.ImportDocumentsRequest.ReconciliationMode.FULL,
+        )
+
+        operation = client.import_documents(request=request)
+        logging.info(f"Waiting for import operation: {operation.operation.name}")
+        operation.result()
+
+    client_options = ClientOptions(
+        api_endpoint=f"{region_vertex_ai_search}-discoveryengine.googleapis.com"
+    )
+
+    logging.info("Updating data store schema...")
+    update_data_store_schema(
+        project_id=project_id,
+        location=region_vertex_ai_search,
+        data_store_id=data_store_id,
+        field_name=embedding_column,
+        client_options=client_options,
+    )
+    logging.info("Schema updated successfully")
+
+    logging.info("Importing data into store...")
+    add_data_in_store(
+        project_id=project_id,
+        location=region_vertex_ai_search,
+        data_store_id=data_store_id,
+        client_options=client_options,
+        input_files_uri=input_files.uri,
+    )
+    logging.info("Data import completed")
+
+
+# ======= File: app/patterns/agentic_rag_vertex_ai_search/pattern_setup/resources_to_copy/data_processing/data_processing_pipeline/pipeline.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from kfp import dsl
+from data_processing_pipeline.components import process_data, ingest_data_in_datastore
+
+
+@dsl.pipeline(description="A pipeline to run ingestion of new data into the datastore")
+def pipeline(
+    project_id: str,
+    region_vertex_ai_search: str,
+    data_store_id: str,
+    embedding_model: str = "text-embedding-004",
+    file_url: str = "https://services.google.com/fh/files/misc/practitioners_guide_to_mlops_whitepaper.pdf",
+    file_type: str = "pdf",
+) -> None:
+    """Processes a document and ingests it into Vertex AI Search datastore."""
+
+    # Process the document and generate embeddings
+    processed_data = process_data(
+        embedding_model=embedding_model, 
+        file_url=file_url,
+        file_type=file_type
+    )
+
+    # Ingest the processed data into Vertex AI Search datastore
+    ingest_data_in_datastore(
+        project_id=project_id,
+        region_vertex_ai_search=region_vertex_ai_search,
+        input_files=processed_data.output,
+        data_store_id=data_store_id,
+    )
+
+
+# ======= File: app/patterns/agentic_rag_vertex_ai_search/pattern_setup/resources_to_copy/data_processing/data_processing_pipeline/submit_pipeline.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import argparse
+import sys
+from google.cloud import aiplatform
+from kfp import compiler
+from data_processing_pipeline.pipeline import pipeline
+
+
+PIPELINE_FILE_NAME = "data_processing_pipeline.json"
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments for pipeline configuration."""
+
+    parser = argparse.ArgumentParser(description="Pipeline configuration")
+    parser.add_argument(
+        "--project-id", default=os.getenv("PROJECT_ID"), help="GCP Project ID"
+    )
+    parser.add_argument(
+        "--region", default=os.getenv("REGION"), help="Vertex AI Pipelines region"
+    )
+    parser.add_argument(
+        "--region-vertex-ai-search",
+        default=os.getenv("REGION_VERTEX_AI_SEARCH"),
+        help="Vertex AI Search region",
+    )
+    parser.add_argument(
+        "--data-store-id", default=os.getenv("DATA_STORE_ID"), help="Data store ID"
+    )
+    parser.add_argument(
+        "--service-account",
+        default=os.getenv("SERVICE_ACCOUNT"),
+        help="Service account",
+    )
+    parser.add_argument(
+        "--pipeline-root",
+        default=os.getenv("PIPELINE_ROOT"),
+        help="Pipeline root directory",
+    )
+    parser.add_argument(
+        "--pipeline-name", default=os.getenv("PIPELINE_NAME"), help="Pipeline name"
+    )
+    parser.add_argument(
+        "--disable-caching",
+        type=bool,
+        default=os.getenv("DISABLE_CACHING", "false").lower() == "true",
+        help="Enable pipeline caching",
+    )
+    parser.add_argument(
+        "--cron-schedule",
+        default=os.getenv("CRON_SCHEDULE", None),
+        help="Cron schedule",
+    )
+    parser.add_argument(
+        "--schedule-only",
+        type=bool,
+        default=os.getenv("SCHEDULE_ONLY", "false").lower() == "true",
+        help="Schedule only (do not submit)",
+    )
+    parsed_args = parser.parse_args()
+
+    # Validate required parameters
+    missing_params = []
+    required_params = {
+        "project_id": parsed_args.project_id,
+        "region": parsed_args.region,
+        "region_vertex_ai_search": parsed_args.region_vertex_ai_search,
+        "data_store_id": parsed_args.data_store_id,
+        "service_account": parsed_args.service_account,
+        "pipeline_root": parsed_args.pipeline_root,
+        "pipeline_name": parsed_args.pipeline_name,
+    }
+
+    for param_name, param_value in required_params.items():
+        if param_value is None:
+            missing_params.append(param_name)
+
+    if missing_params:
+        print("Error: The following required parameters are missing:")
+        for param in missing_params:
+            print(f"  - {param}")
+        print(
+            "\nPlease provide these parameters either through environment variables or command line arguments."
+        )
+        sys.exit(1)
+
+    return parsed_args
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    if args.schedule_only and not args.cron_schedule:
+        print("Missing --cron-schedule argument for scheduling")
+        sys.exit(1)
+
+    # Print configuration
+    print("\nConfiguration:")
+    print("--------------")
+    print(f"project_id: {args.project_id}")
+    print(f"region: {args.region}")
+    print(f"region_search: {args.region_vertex_ai_search}")
+    print(f"data_store_id: {args.data_store_id}")
+    print(f"service_account: {args.service_account}")
+    print(f"pipeline_root: {args.pipeline_root}")
+    print(f"cron_schedule: {args.cron_schedule}")
+    print(f"pipeline_name: {args.pipeline_name}")
+    print(f"disable_caching: {args.disable_caching}")
+    print(f"schedule_only: {args.schedule_only}")
+    print("--------------\n")
+
+    compiler.Compiler().compile(pipeline_func=pipeline, package_path=PIPELINE_FILE_NAME)
+
+    if not args.schedule_only:
+        job = aiplatform.PipelineJob(
+            display_name=args.pipeline_name,
+            template_path=PIPELINE_FILE_NAME,
+            pipeline_root=args.pipeline_root,
+            project=args.project_id,
+            enable_caching=(not args.disable_caching),
+            location=args.region,
+            parameter_values={
+                "project_id": args.project_id,
+                "region_vertex_ai_search": args.region_vertex_ai_search,
+                "data_store_id": args.data_store_id,
+            },
+        )
+        print("Running pipeline and waiting for completion...")
+        job.submit(service_account=args.service_account)
+        job.wait()
+        print("Pipeline completed!")
+
+    if args.cron_schedule:
+        if args.schedule_only:
+            job = aiplatform.PipelineJob(
+                display_name=args.pipeline_name,
+                template_path=PIPELINE_FILE_NAME,
+                pipeline_root=args.pipeline_root,
+                project=args.project_id,
+                enable_caching=(not args.disable_caching),
+                location=args.region,
+                parameter_values={
+                    "project_id": args.project_id,
+                    "region_vertex_ai_search": args.region_vertex_ai_search,
+                    "data_store_id": args.data_store_id,
+                },
+            )
+        pipeline_job_schedule = aiplatform.PipelineJobSchedule(
+            pipeline_job=job,
+            display_name=f"{args.pipeline_name} Weekly Ingestion Job",
+            credentials=job.credentials,
+            project=job.project,
+            location=job.location,
+        )
+
+        schedule_list = pipeline_job_schedule.list(
+            filter=f'display_name="{args.pipeline_name} Weekly Ingestion Job"',
+            project=args.project_id,
+            location=args.region,
+        )
+        print("Schedule lists found: ", schedule_list)
+        if not schedule_list:
+            pipeline_job_schedule.create(
+                cron=args.cron_schedule, service_account=args.service_account
+            )
+            print("Schedule created")
+        else:
+            schedule_list[0].update(cron=args.cron_schedule)
+            print("Schedule updated")
+
+    # Clean up pipeline file
+    if os.path.exists(PIPELINE_FILE_NAME):
+        os.remove(PIPELINE_FILE_NAME)
+        print(f"Deleted {PIPELINE_FILE_NAME}")
+
+
+# ======= File: app/patterns/agentic_rag_vertex_ai_search/pattern_setup/resources_to_copy/deployment/cd/deploy-to-prod.yaml =======
+
+steps:
+  - name: "python:3.10"
+    id: deploy-data-ingestion-pipeline-prod
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        cd data_processing && pip install poetry==1.8.3 --user && python -m poetry install && \
+        python -m poetry run python data_processing_pipeline/submit_pipeline.py
+    env:
+      - "PIPELINE_ROOT=${_PIPELINE_GCS_ROOT}"
+      - "REGION=${_REGION}"
+      - "REGION_VERTEX_AI_SEARCH=${_REGION_VERTEX_AI_SEARCH}"
+      - "DATA_STORE_ID=${_DATA_STORE_ID}"
+      - "PROJECT_ID=${_PROD_PROJECT_ID}"
+      - "SERVICE_ACCOUNT=${_PIPELINE_SA_EMAIL}"
+      - "PIPELINE_NAME=${_PIPELINE_NAME}"
+      - "CRON_SCHEDULE=${_PIPELINE_CRON_SCHEDULE}"
+      - "DISABLE_CACHING=TRUE"
+
+  - name: "gcr.io/cloud-builders/gcloud"
+    id: trigger-deployment
+    entrypoint: gcloud
+    args:
+      - "run"
+      - "deploy"
+      - "genai-app-sample"
+      - "--image"
+      - "$_REGION-docker.pkg.dev/$PROJECT_ID/$_ARTIFACT_REGISTRY_REPO_NAME/$_CONTAINER_NAME"
+      - "--region"
+      - "$_REGION"
+      - "--project"
+      - $_PROD_PROJECT_ID
+      - "--min-instances"
+      - "1"
+      - "--no-cpu-throttling"
+      - "--cpu"
+      - "4"
+      - "--memory"
+      - "4Gi"
+      - "--concurrency"
+      - "40"
+      - "--service-account"
+      - "${_CLOUD_RUN_APP_SA_NAME}@${_PROD_PROJECT_ID}.iam.gserviceaccount.com"
+      - "--set-env-vars"
+      - "COMMIT_SHA=${COMMIT_SHA},DATA_STORE_ID=${_DATA_STORE_ID},REGION=${_REGION},REGION_VERTEX_AI_SEARCH=${_REGION_VERTEX_AI_SEARCH}"
+
+substitutions:
+  _PROD_PROJECT_ID: YOUR_PROD_PROJECT_ID
+  _CONTAINER_NAME: genai-app-sample
+  _ARTIFACT_REGISTRY_REPO_NAME: genai-containers
+  _CLOUD_RUN_APP_SA_NAME: genai-app-sample-cr-sa
+  _REGION: us-central1
+
+  _REGION_VERTEX_AI_SEARCH: us
+  _PIPELINE_GCS_ROOT: _PIPELINE_GCS_ROOT
+  _PIPELINE_SA_EMAIL: YOUR_PIPELINE_SA_EMAIL
+  _DATA_STORE_ID: PROD_DATASTORE_ID
+  _PIPELINE_NAME: genai_sample_data_processing
+  _PIPELINE_CRON_SCHEDULE: YOUR_CRON_SCHEDULE
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+
+# ======= File: app/patterns/agentic_rag_vertex_ai_search/pattern_setup/resources_to_copy/deployment/cd/staging.yaml =======
+
+steps:
+  # Build and Push
+  - name: "python:3.10"
+    id: deploy-data-ingestion-pipeline-staging
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        cd data_processing && pip install poetry==1.8.3 --user && python -m poetry install && \
+        python -m poetry run python data_processing_pipeline/submit_pipeline.py
+    env:
+      - "PIPELINE_ROOT=${_PIPELINE_GCS_ROOT}"
+      - "REGION=${_REGION}"
+      - "REGION_VERTEX_AI_SEARCH=${_REGION_VERTEX_AI_SEARCH}"
+      - "DATA_STORE_ID=${_DATA_STORE_ID}"
+      - "PROJECT_ID=${_STAGING_PROJECT_ID}"
+      - "SERVICE_ACCOUNT=${_PIPELINE_SA_EMAIL}"
+      - "PIPELINE_NAME=${_PIPELINE_NAME}"
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: build-backend-service-container
+    args:
+      [
+        "build",
+        "-t",
+        "$_REGION-docker.pkg.dev/$PROJECT_ID/$_ARTIFACT_REGISTRY_REPO_NAME/$_CONTAINER_NAME",
+        ".",
+      ]
+
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      [
+        "push",
+        "$_REGION-docker.pkg.dev/$PROJECT_ID/$_ARTIFACT_REGISTRY_REPO_NAME/$_CONTAINER_NAME",
+      ]
+
+  # Deploy to Staging
+  - name: "gcr.io/cloud-builders/gcloud"
+    id: deploy-staging
+    entrypoint: gcloud
+    args:
+      - "run"
+      - "deploy"
+      - "genai-app-sample"
+      - "--image"
+      - "$_REGION-docker.pkg.dev/$PROJECT_ID/$_ARTIFACT_REGISTRY_REPO_NAME/$_CONTAINER_NAME"
+      - "--region"
+      - "${_REGION}"
+      - "--project"
+      - "${_STAGING_PROJECT_ID}"
+      - "--min-instances"
+      - "1"
+      - "--no-cpu-throttling"
+      - "--cpu"
+      - "4"
+      - "--memory"
+      - "4Gi"
+      - "--concurrency"
+      - "40"
+      - "--service-account"
+      - "${_CLOUD_RUN_APP_SA_NAME}@${_STAGING_PROJECT_ID}.iam.gserviceaccount.com"
+      - "--set-env-vars"
+      - "COMMIT_SHA=${COMMIT_SHA},DATA_STORE_ID=${_DATA_STORE_ID},REGION=${_REGION},REGION_VERTEX_AI_SEARCH=${_REGION_VERTEX_AI_SEARCH}"
+
+  # Fetch Staging Service URL
+  - name: "gcr.io/cloud-builders/gcloud"
+    id: fetch-staging-url
+    entrypoint: /bin/bash
+    args:
+      - "-c"
+      - |
+        echo $(gcloud run services describe genai-app-sample \
+        --region ${_REGION} --project ${_STAGING_PROJECT_ID} --format="value(status.url)") > staging_url.txt
+
+  # Fetch ID Token
+  - name: gcr.io/cloud-builders/gcloud
+    id: fetch-id-token
+    entrypoint: /bin/bash
+    args:
+      - "-c"
+      - |
+        echo $(gcloud auth print-identity-token -q) > id_token.txt
+
+  # Load Testing
+  - name: "python:3.10"
+    id: load_test
+    entrypoint: /bin/bash
+    args:
+      - "-c"
+      - |
+        export _ID_TOKEN=$(cat id_token.txt)
+        export _STAGING_URL=$(cat staging_url.txt)
+        pip install locust==2.31.1
+        python -m locust -f tests/load_test/load_test.py \
+        -H $$_STAGING_URL \
+        --headless \
+        -t 30s -u 10 -r 0.5 \
+        --csv=tests/load_test/.results/results \
+        --html=tests/load_test/.results/report.html
+
+  # Export Load Test Results to GCS
+  - name: gcr.io/cloud-builders/gcloud
+    id: export-results-to-gcs
+    entrypoint: /bin/bash
+    args:
+      - "-c"
+      - |
+        export _TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+        gsutil -m cp -r tests/load_test/.results gs://${_BUCKET_NAME_LOAD_TEST_RESULTS}/results-$${_TIMESTAMP}
+        echo "_________________________________________________________________________"
+        echo "Load test results copied to gs://${_BUCKET_NAME_LOAD_TEST_RESULTS}/results-$${_TIMESTAMP}"
+        echo "HTTP link: https://console.cloud.google.com/storage/browser/${_BUCKET_NAME_LOAD_TEST_RESULTS}/results-$${_TIMESTAMP}"
+        echo "_________________________________________________________________________"
+
+  # # Trigger Prod Deployment
+  - name: gcr.io/cloud-builders/gcloud
+    id: trigger-prod-deployment
+    entrypoint: gcloud
+    args:
+      - "beta"
+      - "builds"
+      - "triggers"
+      - "run"
+      - "deploy-to-prod-pipeline"
+      - "--region"
+      - "$_REGION"
+      - "--project"
+      - "$PROJECT_ID"
+      - "--substitutions"
+      - "_CONTAINER_NAME=${_CONTAINER_NAME}"
+      - "--sha"
+      - $COMMIT_SHA
+
+  - name: gcr.io/cloud-builders/gcloud
+    id: echo-view-build-trigger-link
+    entrypoint: /bin/bash
+    args:
+      - "-c"
+      - |
+        echo "_________________________________________________________________________"
+        echo "Production deployment triggered. View progress and / or approve on the Cloud Build Console:"
+        echo "https://console.cloud.google.com/cloud-build/builds;region=$_REGION"
+        echo "_________________________________________________________________________"
+
+substitutions:
+  _STAGING_PROJECT_ID: YOUR_STAGING_PROJECT_ID # Replace with your staging project ID
+  _BUCKET_NAME_LOAD_TEST_RESULTS: YOUR_CICD_PROJECT_ID-cicd-load-test-results # Replace with your GCS bucket name
+  _CONTAINER_NAME: genai-app-sample
+  _ARTIFACT_REGISTRY_REPO_NAME: genai-containers
+  _CLOUD_RUN_APP_SA_NAME: genai-app-sample-cr-sa
+  _REGION: us-central1
+
+  _REGION_VERTEX_AI_SEARCH: us
+  _PIPELINE_GCS_ROOT: _PIPELINE_GCS_ROOT
+  _PIPELINE_SA_EMAIL: YOUR_PIPELINE_SA_EMAIL
+  _DATA_STORE_ID: STAGING_DATASTORE_ID
+  _PIPELINE_NAME: genai_sample_data_processing
+  _PIPELINE_CRON_SCHEDULE: YOUR_CRON_SCHEDULE
+
+options:
+  substitutionOption: ALLOW_LOOSE
+  defaultLogsBucketBehavior: REGIONAL_USER_OWNED_BUCKET
+serviceAccount: projects/${PROJECT_ID}/serviceAccounts/cicd-runner@${PROJECT_ID}.iam.gserviceaccount.com
+
+
+# ======= File: app/patterns/custom_rag_qa/chain.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# mypy: disable-error-code="arg-type,attr-defined"
+# pylint: disable=W0613, W0622
+
+import logging
+from typing import Any, AsyncIterator, Dict, List
+
+from app.patterns.custom_rag_qa.templates import (
+    inspect_conversation_template,
+    rag_template,
+    template_docs,
+)
+from app.patterns.custom_rag_qa.vector_store import get_vector_store
+from app.utils.decorators import custom_chain
+from app.utils.output_types import OnChatModelStreamEvent, OnToolEndEvent
+import google
+from langchain.schema import Document
+from langchain.tools import tool
+from langchain_core.messages import ToolMessage
+from langchain_google_community.vertex_rank import VertexAIRank
+from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
+import vertexai
+
+# Configuration
+LOCATION = "us-central1"
+EMBEDDING_MODEL = "text-embedding-004"
+LLM = "gemini-1.5-flash-002"
+TOP_K = 5
+
+# Initialize logging
+logging.basicConfig(level=logging.INFO)
+
+# Initialize Google Cloud and Vertex AI
+credentials, project_id = google.auth.default()
+vertexai.init(project=project_id, location=LOCATION)
+
+# Set up embedding model and vector store
+embedding = VertexAIEmbeddings(model_name=EMBEDDING_MODEL)
+vector_store = get_vector_store(embedding=embedding)
+retriever = vector_store.as_retriever(search_kwargs={"k": 20})
+
+# Initialize document compressor
+compressor = VertexAIRank(
+    project_id=project_id,
+    location_id="global",
+    ranking_config="default_ranking_config",
+    title_field="id",
+    top_n=TOP_K,
+)
+
+
+@tool
+def retrieve_docs(query: str) -> List[Document]:
+    """
+    Useful for retrieving relevant documents based on a query.
+    Use this when you need additional information to answer a question.
+
+    Args:
+        query (str): The user's question or search query.
+
+    Returns:
+        List[Document]: A list of the top-ranked Document objects, limited to TOP_K (5) results.
+    """
+    retrieved_docs = retriever.invoke(query)
+    ranked_docs = compressor.compress_documents(documents=retrieved_docs, query=query)
+    return ranked_docs
+
+
+@tool
+def should_continue() -> None:
+    """
+    Use this tool if you determine that you have enough context to respond to the questions of the user.
+    """
+    return None
+
+
+# Initialize language model
+llm = ChatVertexAI(model=LLM, temperature=0, max_tokens=1024)
+
+# Set up conversation inspector
+inspect_conversation = inspect_conversation_template | llm.bind_tools(
+    [retrieve_docs, should_continue], tool_choice="any"
+)
+
+# Set up response chain
+response_chain = rag_template | llm
+
+
+@custom_chain
+async def chain(
+    input: Dict[str, Any], **kwargs: Any
+) -> AsyncIterator[OnToolEndEvent | OnChatModelStreamEvent]:
+    """
+    Implement a RAG QA chain with tool calls.
+
+    This function is decorated with `custom_chain` to offer LangChain compatible
+    astream_events, support for synchronous invocation through the `invoke` method,
+    and OpenTelemetry tracing.
+    """
+    # Inspect conversation and determine next action
+    inspection_result = inspect_conversation.invoke(input)
+    tool_call_result = inspection_result.tool_calls[0]
+
+    # Execute the appropriate tool based on the inspection result
+    if tool_call_result["name"] == "retrieve_docs":
+        # Retrieve relevant documents
+        docs = retrieve_docs.invoke(tool_call_result["args"])
+        # Format the retrieved documents
+        formatted_docs = template_docs.format(docs=docs)
+        # Create a ToolMessage with the formatted documents
+        tool_message = ToolMessage(
+            tool_call_id=tool_call_result["name"],
+            name=tool_call_result["name"],
+            content=formatted_docs,
+            artifact=docs,
+        )
+    else:
+        # If no documents need to be retrieved, continue with the conversation
+        tool_message = should_continue.invoke(tool_call_result)
+
+    # Update input messages with new information
+    input["messages"] = input["messages"] + [inspection_result, tool_message]
+
+    # Yield tool results metadata
+    yield OnToolEndEvent(
+        data={"input": tool_call_result["args"], "output": tool_message}
+    )
+
+    # Stream LLM response
+    async for chunk in response_chain.astream(input=input):
+        yield OnChatModelStreamEvent(data={"chunk": chunk})
+
+
+# ======= File: app/patterns/custom_rag_qa/templates.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# flake8: noqa: W291
+
+from langchain_core.prompts import (
+    ChatPromptTemplate,
+    MessagesPlaceholder,
+    PromptTemplate,
+)
+
+template_docs = PromptTemplate.from_template(
+    """## Context provided:
+{% for doc in docs%}
+<Document {{ loop.index0 }}>
+{{ doc.page_content | safe }}
+</Document {{ loop.index0 }}>
+{% endfor %}
+""",
+    template_format="jinja2",
+)
+
+inspect_conversation_template = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are an AI assistant tasked with analyzing the conversation "
+and determining the best course of action.""",
+        ),
+        MessagesPlaceholder(variable_name="messages"),
+    ]
+)
+
+rag_template = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are an AI assistant for question-answering tasks. 
+
+Answer to the best of your ability using the context provided. 
+If you're unsure, it's better to acknowledge limitations than to speculate.
+""",
+        ),
+        MessagesPlaceholder(variable_name="messages"),
+    ]
+)
+
+
+# ======= File: app/patterns/custom_rag_qa/vector_store.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import os
+from typing import List
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import SKLearnVectorStore
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+
+PERSIST_PATH = ".persist_vector_store"
+URL = "https://services.google.com/fh/files/misc/practitioners_guide_to_mlops_whitepaper.pdf"
+
+
+def load_and_split_documents(url: str) -> List[Document]:
+    """Load and split documents from a given URL."""
+    loader = PyPDFLoader(url)
+    documents = loader.load()
+    logging.info(f"# of documents loaded (pre-chunking) = {len(documents)}")
+
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    doc_splits = text_splitter.split_documents(documents)
+    logging.info(f"# of documents after split = {len(doc_splits)}")
+
+    return doc_splits
+
+
+def get_vector_store(
+    embedding: Embeddings, persist_path: str = PERSIST_PATH, url: str = URL
+) -> SKLearnVectorStore:
+    """Get or create a vector store."""
+    vector_store = SKLearnVectorStore(embedding=embedding, persist_path=persist_path)
+
+    if not os.path.exists(persist_path):
+        doc_splits = load_and_split_documents(url=url)
+        vector_store.add_documents(documents=doc_splits)
+        vector_store.persist()
+
+    return vector_store
+
+
+# ======= File: app/utils/__init__.py =======
+
+
+
+# ======= File: app/utils/decorators.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Utility module providing decorator for chain implementations.
+
+This module contains a decorator for implementing chains with
+Python-based orchestration, as shown in app/patterns/custom_rag_qa/chain.py.
+
+The decorators help standardize chain implementations and provide common functionality
+like event streaming and tracing.
+
+When using frameworks like LangGraph or CrewAI that provide their own orchestration, this file
+can be safely removed.
+"""
+from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
+import inspect
+from typing import Any, AsyncGenerator, Callable, List, Union
+
+from app.utils.output_types import OnChatModelStreamEvent, OnToolEndEvent
+from langchain_core.messages import AIMessage
+from langchain_core.runnables.utils import Input
+from tqdm import tqdm
+from traceloop.sdk import TracerWrapper
+from traceloop.sdk.decorators import aworkflow
+
+
+class CustomChain:
+    """A custom chain class that wraps a callable function."""
+
+    def __init__(self, func: Callable):
+        """Initialize the CustomChain with a callable function."""
+        self.func = func
+
+    async def astream_events(self, *args: Any, **kwargs: Any) -> AsyncGenerator:
+        """
+        Asynchronously stream events from the wrapped function.
+        Applies Traceloop workflow decorator if Traceloop SDK is initialized.
+        """
+
+        if hasattr(TracerWrapper, "instance"):
+            func = aworkflow()(self.func)
+        else:
+            func = self.func
+
+        async_gen = func(*args, **kwargs)
+
+        # Traceloop "aworkflow" decorator returns a co-routine which should be awaited
+        if inspect.iscoroutine(async_gen):
+            async_gen = await async_gen
+
+        async for event in async_gen:
+            yield event.model_dump()
+
+    def invoke(self, *args: Any, **kwargs: Any) -> AIMessage:
+        """
+        Invoke the wrapped function and process its events.
+        Returns an AIMessage with content and relative tool calls.
+        """
+        events = self.func(*args, **kwargs)
+        response_content = ""
+        tool_calls = []
+        for event in events:
+            if isinstance(event, OnChatModelStreamEvent):
+                if not isinstance(event.data.chunk.content, str):
+                    raise ValueError("Chunk content must be a string")
+                response_content += event.data.chunk.content
+            elif isinstance(event, OnToolEndEvent):
+                tool_calls.append(event.data.model_dump())
+        return AIMessage(
+            content=response_content, additional_kwargs={"tool_calls_data": tool_calls}
+        )
+
+    def batch(
+        self,
+        inputs: List[Input],
+        *args: Any,
+        max_workers: Union[int, None] = None,
+        **kwargs: Any
+    ) -> List[AIMessage]:
+        """
+        Invoke the wrapped function and process its events in batch.
+        Returns a List of AIMessage with content and relative tool calls.
+        """
+        predicted_messages = []
+        with ThreadPoolExecutor(max_workers) as pool:
+            for response in tqdm(
+                pool.map(self.invoke, inputs, *args, **kwargs), total=len(inputs)
+            ):
+                predicted_messages.append(response)
+        return predicted_messages
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Make the CustomChain instance callable, invoking the wrapped function."""
+        return self.func(*args, **kwargs)
+
+
+def custom_chain(func: Callable) -> CustomChain:
+    """
+    Decorator function that wraps a callable in a CustomChain instance.
+    """
+
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        return func(*args, **kwargs)
+
+    return CustomChain(wrapper)
+
+
+# ======= File: app/utils/input_types.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from typing import Annotated, Any, List, Literal, Optional, Union
+
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from pydantic import BaseModel, Field
+
+
+class InputChat(BaseModel):
+    """Represents the input for a chat session."""
+
+    messages: List[
+        Annotated[
+            Union[HumanMessage, AIMessage, ToolMessage], Field(discriminator="type")
+        ]
+    ] = Field(
+        ..., description="The chat messages representing the current conversation."
+    )
+    user_id: str = ""
+    session_id: str = ""
+
+
+class Input(BaseModel):
+    """Wrapper class for InputChat."""
+
+    input: InputChat
+
+
+class Feedback(BaseModel):
+    """Represents feedback for a conversation."""
+
+    score: Union[int, float]
+    text: Optional[str] = ""
+    run_id: str
+    log_type: Literal["feedback"] = "feedback"
+
+
+def default_serialization(obj: Any) -> Any:
+    """
+    Default serialization for LangChain objects.
+    Converts BaseModel instances to dictionaries.
+    """
+    if isinstance(obj, BaseModel):
+        return obj.model_dump()
+
+
+# ======= File: app/utils/output_types.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from typing import Dict, Literal
+import uuid
+
+from langchain_core.messages import AIMessageChunk, ToolMessage
+from pydantic import BaseModel, Field
+
+
+class BaseCustomChainEvent(BaseModel):
+    """Base class for custom chain events."""
+
+    name: str = "custom_chain_event"
+
+    class Config:
+        """Allow extra fields in the model."""
+
+        extra = "allow"
+
+
+class OnToolStartEvent(BaseCustomChainEvent):
+    """Event representing the start of a tool execution."""
+
+    event: Literal["on_tool_start"] = "on_tool_start"
+    input: Dict = {}
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+
+
+class ToolData(BaseModel):
+    """Data structure for tool input and output."""
+
+    input: Dict = {}
+    output: ToolMessage
+
+
+class OnToolEndEvent(BaseCustomChainEvent):
+    """Event representing the end of a tool execution."""
+
+    event: Literal["on_tool_end"] = "on_tool_end"
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    data: ToolData
+
+
+class ChatModelStreamData(BaseModel):
+    """Data structure for chat model stream chunks."""
+
+    chunk: AIMessageChunk
+
+
+class OnChatModelStreamEvent(BaseCustomChainEvent):
+    """Event representing a chunk of streamed chat model output."""
+
+    event: Literal["on_chat_model_stream"] = "on_chat_model_stream"
+    data: ChatModelStreamData
+
+
+class Event(BaseModel):
+    """Generic event structure."""
+
+    event: str = "data"
+    data: dict
+
+
+class EndEvent(BaseModel):
+    """Event representing the end of a stream."""
+
+    event: Literal["end"] = "end"
+
+
+# ======= File: app/utils/tracing.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import logging
+from typing import Any, Optional, Sequence
+
+from google.cloud import logging as google_cloud_logging
+from google.cloud import storage
+from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
+from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.sdk.trace.export import SpanExportResult
+
+
+class CloudTraceLoggingSpanExporter(CloudTraceSpanExporter):
+    """
+    An extended version of CloudTraceSpanExporter that logs span data to Google Cloud Logging
+    and handles large attribute values by storing them in Google Cloud Storage.
+
+    This class helps bypass the 256 character limit of Cloud Trace for attribute values
+    by leveraging Cloud Logging (which has a 256KB limit) and Cloud Storage for larger payloads.
+    """
+
+    def __init__(
+        self,
+        logging_client: Optional[google_cloud_logging.Client] = None,
+        storage_client: Optional[storage.Client] = None,
+        bucket_name: Optional[str] = None,
+        debug: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        """
+        Initialize the exporter with Google Cloud clients and configuration.
+
+        :param logging_client: Google Cloud Logging client
+        :param storage_client: Google Cloud Storage client
+        :param bucket_name: Name of the GCS bucket to store large payloads
+        :param debug: Enable debug mode for additional logging
+        :param kwargs: Additional arguments to pass to the parent class
+        """
+        super().__init__(**kwargs)
+        self.debug = debug
+        self.logging_client = logging_client or google_cloud_logging.Client(
+            project=self.project_id
+        )
+        self.logger = self.logging_client.logger(__name__)
+        self.storage_client = storage_client or storage.Client(project=self.project_id)
+        self.bucket_name = bucket_name or f"{self.project_id}-logs-data"
+        self.bucket = self.storage_client.bucket(self.bucket_name)
+
+    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        """
+        Export the spans to Google Cloud Logging and Cloud Trace.
+
+        :param spans: A sequence of spans to export
+        :return: The result of the export operation
+        """
+        for span in spans:
+            span_context = span.get_span_context()
+            trace_id = format(span_context.trace_id, "x")
+            span_id = format(span_context.span_id, "x")
+            span_dict = json.loads(span.to_json())
+
+            span_dict["trace"] = f"projects/{self.project_id}/traces/{trace_id}"
+            span_dict["span_id"] = span_id
+
+            span_dict = self._process_large_attributes(
+                span_dict=span_dict, span_id=span_id
+            )
+
+            if self.debug:
+                print(span_dict)
+
+            # Log the span data to Google Cloud Logging
+            self.logger.log_struct(span_dict, severity="INFO")
+
+        # Export spans to Google Cloud Trace using the parent class method
+        return super().export(spans)
+
+    def store_in_gcs(self, content: str, span_id: str) -> str:
+        """
+        Initiate storing large content in Google Cloud Storage/
+
+        :param content: The content to store
+        :param span_id: The ID of the span
+        :return: The  GCS URI of the stored content
+        """
+        if not self.storage_client.bucket(self.bucket_name).exists():
+            logging.warning(
+                f"Bucket {self.bucket_name} not found. "
+                "Unable to store span attributes in GCS."
+            )
+            return "GCS bucket not found"
+
+        blob_name = f"spans/{span_id}.json"
+        blob = self.bucket.blob(blob_name)
+
+        blob.upload_from_string(content, "application/json")
+        return f"gs://{self.bucket_name}/{blob_name}"
+
+    def _process_large_attributes(self, span_dict: dict, span_id: str) -> dict:
+        """
+        Process large attribute values by storing them in GCS if they exceed the size
+        limit of Google Cloud Logging.
+
+        :param span_dict: The span data dictionary
+        :param trace_id: The trace ID
+        :param span_id: The span ID
+        :return: The updated span dictionary
+        """
+        attributes = span_dict["attributes"]
+        if len(json.dumps(attributes).encode()) > 255 * 1024:  # 250 KB
+            # Separate large payload from other attributes
+            attributes_payload = {
+                k: v
+                for k, v in attributes.items()
+                if "traceloop.association.properties" not in k
+            }
+            attributes_retain = {
+                k: v
+                for k, v in attributes.items()
+                if "traceloop.association.properties" in k
+            }
+
+            # Store large payload in GCS
+            gcs_uri = self.store_in_gcs(json.dumps(attributes_payload), span_id)
+            attributes_retain["uri_payload"] = gcs_uri
+            attributes_retain["url_payload"] = (
+                f"https://storage.mtls.cloud.google.com/"
+                f"{self.bucket_name}/spans/{span_id}.json"
+            )
+
+            span_dict["attributes"] = attributes_retain
+            logging.info(
+                "Length of payload span above 250 KB, storing attributes in GCS "
+                "to avoid large log entry errors"
+            )
+
+        return span_dict
+
+
+# ======= File: app/eval/utils.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import glob
+from typing import Any, Dict, List
+
+import pandas as pd
+import yaml
+
+
+def load_chats(path: str) -> List[Dict[str, Any]]:
+    """
+    Loads a list of chats from a directory or file.
+
+    Args:
+        path (str): The path to the directory or file containing the chats.
+
+    Returns:
+        List[Dict[str, Any]]: A list of chats.
+    """
+
+    chats: List[Dict[str, Any]] = []
+    for file_path in glob.glob(path):
+        with open(file_path) as f:
+            chats_in_file = yaml.safe_load(f)
+            chats = chats + chats_in_file
+    return chats
+
+
+def _process_conversation(row: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Processes a single conversation row to extract messages and build conversation history.
+    Most human-ai interactions are composed of a human message followed by an ai message.
+    But when there's a tool call, the interactions are as follows:
+    - human message
+    - ai message with empty content and tool_calls set
+    - tool message with tool call arguments
+    - ai message with non-empty content and tool_calls empty.
+    In any case the human message is the first in the set and the final answer is the last in the set.
+    """
+    conversation_history: List[Dict] = []
+    messages: List[Dict[str, Any]] = []
+    messages_since_last_human_message: List[Dict[str, Any]] = []
+
+    for message in row["messages"]:
+        if message["type"] == "human":
+            # Reset for new human message
+            messages_since_last_human_message = []
+
+        # Add current message to temporary storage
+        messages_since_last_human_message.append(message)
+
+        # Check if this is a final AI response (not a tool call)
+        if message["type"] == "ai" and (
+            "tool_calls" not in message or len(message["tool_calls"]) == 0
+        ):
+            # Process the completed exchange
+            messages.append(
+                {
+                    "human_message": messages_since_last_human_message[
+                        0
+                    ],  # First message is human
+                    "ai_message": messages_since_last_human_message[
+                        -1
+                    ],  # Last message is AI's final response
+                    "conversation_history": conversation_history.copy(),  # Include previous conversation
+                }
+            )
+
+            # Update overall conversation history
+            conversation_history.extend(messages_since_last_human_message)
+    return messages
+
+
+def generate_multiturn_history(df: pd.DataFrame) -> pd.DataFrame:
+    """Processes a DataFrame of conversations to create a multi-turn history.
+
+    This function iterates through a DataFrame where each row represents a conversation.
+    It extracts human and AI messages from the "messages" column and structures them
+    into a new DataFrame. Each row in the output DataFrame represents a single turn
+    in a conversation, including the human message, AI message, and the conversation
+    history up to that point.
+
+    Args:
+        df (pd.DataFrame): A DataFrame where each row represents a conversation.
+                           The DataFrame should have a column named "messages" containing
+                           a list of alternating human and AI messages.
+
+    Returns:
+        pd.DataFrame: A DataFrame where each row represents a single turn in a conversation.
+                      The DataFrame has the following columns:
+                          - human_message: The human message in that turn.
+                          - ai_message: The AI message in that turn.
+                          - conversation_history: A list of all messages in the conversation
+                                                  up to the current turn (excluded).
+    """
+    processed_messages = df.apply(_process_conversation, axis=1).explode().tolist()
+    return pd.DataFrame(processed_messages)
+
+
+# ======= File: app/eval/data/chats.yaml =======
+
+- messages:
+    - type: human
+      content: Hi
+    - type: ai
+      content: Hi, how can I help you?
+    - type: human
+      content: I'm looking for a recipe for a healthy dinner. Do you have any recommendations?
+    - type: ai
+      content: Sure, I can help you with that. What are your dietary restrictions? Are you vegetarian, vegan, gluten-free, or anything else?
+    - type: human
+      content: I'm not vegetarian or vegan, but I am gluten-free.
+    - type: ai
+      content: "Okay, I ll keep that in mind. Here are a few recipes that I think you might like: * **Grilled Salmon with Roasted Vegetables:** This is a delicious and healthy recipe that is perfect for a weeknight meal. The salmon is grilled to perfection and the roasted vegetables add a touch of sweetness. * **Chicken Stir-Fry:** This is a quick and easy stir-fry that is perfect for busy weeknights. The chicken is cooked with vegetables and a light sauce. * **Lentil Soup:** This is a hearty and healthy soup that is perfect for a cold winter day. The lentils are packed with protein and fiber, and the soup is also gluten-free."
+    - type: human
+      content: Those all sound great! I think I'm going to try the grilled salmon with roasted vegetables.
+    - type: ai
+      content: That's a great choice! I hope you enjoy it.
+    - type: human
+      content: Thanks for your help!
+    - type: ai
+      content: You're welcome! Is there anything else I can help you with today?
+    - type: human
+      content: No, that's all. Thanks again!
+    - type: ai
+      content: You're welcome! Have a great day!
+- messages:
+    - type: human
+      content: Hi
+    - type: ai
+      content: Hi, how can I help you?
+    - type: human
+      content: I'm looking for a recipe for a romantic dinner. Do you have any recommendations?
+    - type: ai
+      content: Sure, I can help you with that. What are your dietary restrictions? Are you vegetarian, vegan, gluten-free, or anything else?
+    - type: human
+      content: I'm vegetarian.
+    - type: ai
+      content: "Sure, I can help you find a healthy vegetarian dinner recipe. Here are a few ideas: * **Burnt aubergine veggie chilli:** This is a hearty and flavorful dish that is packed with nutrients. The roasted aubergine gives it a smoky flavor, and the lentils and beans add protein and fiber. * **Simple mushroom curry:** This is a quick and easy curry that is perfect for a weeknight meal. The mushrooms are cooked in a creamy sauce with spices, and the whole dish is ready in under 30 minutes. * **Vegetarian enchiladas:** This is a classic Mexican dish that is easy to make vegetarian. The enchiladas are filled with a variety of vegetables, and they are topped with a delicious sauce. * **Braised sesame tofu:** This is a flavorful and satisfying dish that is perfect for a cold night. The tofu is braised in a sauce with sesame, ginger, and garlic, and it is served over rice or noodles. * **Roast garlic & tahini spinach:** This is a light and healthy dish that is perfect for a spring or summer meal. The spinach is roasted with garlic and tahini, and it is served with a side of pita bread. These are just a few ideas to get you started. There are many other great vegetarian dinner recipes out there, so you are sure to find something that you will enjoy."
+    - type: human
+      content: Those all sound great! I like the Burnt aubergine veggie chilli
+    - type: ai
+      content: That's a great choice! I hope you enjoy it.
+
+
+# ======= File: streamlit/side_bar.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# pylint: disable=W0201, E0611
+
+import os
+from typing import Any
+import uuid
+
+from utils.chat_utils import save_chat
+from utils.multimodal_utils import (
+    HELP_GCS_CHECKBOX,
+    HELP_MESSAGE_MULTIMODALITY,
+    upload_files_to_gcs,
+)
+
+EMPTY_CHAT_NAME = "Empty chat"
+NUM_CHAT_IN_RECENT = 3
+DEFAULT_BASE_URL = "http://localhost:8000/"
+
+
+class SideBar:
+    """Manages the sidebar components of the Streamlit application."""
+
+    def __init__(self, st: Any) -> None:
+        """
+        Initialize the SideBar.
+
+        Args:
+            st (Any): The Streamlit object for rendering UI components.
+        """
+        self.st = st
+        self.uploaded_files = None
+        self.uploaded_folder = None
+        if "bucket_name" not in self.st.session_state:
+            self.st.session_state["bucket_name"] = os.environ.get("BUCKET_NAME", "gs://your-bucket-name")
+
+    def init_side_bar(self) -> None:
+        """Initialize and render the sidebar components."""
+        with self.st.sidebar:
+            self.url_input_field = self.st.text_input(
+                label="Local URL",
+                value=os.environ.get("SERVICE_URL", DEFAULT_BASE_URL),
+            )
+            self.should_authenticate_request = self.st.checkbox(
+                label="Authenticate request",
+                value=False,
+                help="If checked, any request to the server will contain an Identity token to allow authentication. "
+                     "See the Cloud Run documentation to know more about authentication: "
+                     "https://cloud.google.com/run/docs/authenticating/service-to-service",
+            )
+            col1, col2, col3 = self.st.columns(3)
+            with col1:
+                if self.st.button("+ New chat"):
+                    if (
+                        len(
+                            self.st.session_state.user_chats[
+                                self.st.session_state["session_id"]
+                            ]["messages"]
+                        )
+                        > 0
+                    ):
+                        self.st.session_state.run_id = None
+
+                        self.st.session_state["session_id"] = str(uuid.uuid4())
+                        self.st.session_state.session_db.get_session(
+                            session_id=self.st.session_state["session_id"],
+                        )
+                        self.st.session_state.user_chats[
+                            self.st.session_state["session_id"]
+                        ] = {
+                            "title": EMPTY_CHAT_NAME,
+                            "messages": [],
+                        }
+
+            with col2:
+                if self.st.button("Delete chat"):
+                    self.st.session_state.run_id = None
+                    self.st.session_state.session_db.clear()
+                    self.st.session_state.user_chats.pop(
+                        self.st.session_state["session_id"]
+                    )
+                    if len(self.st.session_state.user_chats) > 0:
+                        chat_id = list(self.st.session_state.user_chats.keys())[0]
+                        self.st.session_state["session_id"] = chat_id
+                        self.st.session_state.session_db.get_session(
+                            session_id=self.st.session_state["session_id"],
+                        )
+                    else:
+                        self.st.session_state["session_id"] = str(uuid.uuid4())
+                        self.st.session_state.user_chats[
+                            self.st.session_state["session_id"]
+                        ] = {
+                            "title": EMPTY_CHAT_NAME,
+                            "messages": [],
+                        }
+            with col3:
+                if self.st.button("Save chat"):
+                    save_chat(self.st)
+
+            self.st.subheader("Recent")  # Style the heading
+
+            all_chats = list(reversed(self.st.session_state.user_chats.items()))
+            for chat_id, chat in all_chats[:NUM_CHAT_IN_RECENT]:
+                if self.st.button(chat["title"], key=chat_id):
+                    self.st.session_state.run_id = None
+                    self.st.session_state["session_id"] = chat_id
+                    self.st.session_state.session_db.get_session(
+                        session_id=self.st.session_state["session_id"],
+                    )
+
+            with self.st.expander("Other chats"):
+                for chat_id, chat in all_chats[NUM_CHAT_IN_RECENT:]:
+                    if self.st.button(chat["title"], key=chat_id):
+                        self.st.session_state.run_id = None
+                        self.st.session_state["session_id"] = chat_id
+                        self.st.session_state.session_db.get_session(
+                            session_id=self.st.session_state["session_id"],
+                        )
+
+            self.st.divider()
+
+            self.st.header("Upload files from local")
+            # Retrieve previously stored bucket name if available
+            stored_bucket_name = self.st.session_state.get(
+                "bucket_name", os.environ.get("BUCKET_NAME", "gs://your-bucket-name")
+            )
+
+            bucket_name = self.st.text_input(
+                label="GCS Bucket for upload",
+                value=stored_bucket_name,
+                key="bucket_name_input",
+            )
+
+            # Save the bucket_name to session_state if changed
+            if bucket_name != stored_bucket_name:
+                self.st.session_state["bucket_name"] = bucket_name
+
+            if "checkbox_state" not in self.st.session_state:
+                self.st.session_state.checkbox_state = True
+
+            self.st.session_state.checkbox_state = self.st.checkbox(
+                "Upload to GCS first (suggested)", value=False, help=HELP_GCS_CHECKBOX
+            )
+
+            # Add folder upload toggle
+            use_folder_upload = self.st.checkbox(
+                "Upload Entire Folder",
+                value=False,
+                help="Upload multiple files from a .zip file"
+            )
+
+            if use_folder_upload:
+                self.uploaded_files = None  # Reset files when in folder mode
+                self.uploaded_folder = self.st.file_uploader(
+                    "Upload a .zip file containing your documents",
+                    type=["zip"],
+                    key=f"folder_uploader_{self.st.session_state.uploader_key}"
+                )
+                if self.uploaded_folder:
+                    self.st.info(f"Processing {self.uploaded_folder.name}...")
+            else:
+                self.uploaded_folder = None  # Reset folder when in files mode
+                self.uploaded_files = self.st.file_uploader(
+                    label="Send files from local",
+                    accept_multiple_files=True,
+                    key=f"uploader_images_{self.st.session_state.uploader_key}",
+                    type=[
+                        "png", "jpg", "jpeg", "txt", "docx", "pdf",
+                        "rtf", "csv", "tsv", "xlsx", "md", "markdown"
+                    ],
+                )
+
+            if (self.uploaded_files or self.uploaded_folder) and self.st.session_state.checkbox_state:
+                upload_files_to_gcs(
+                    self.st,
+                    bucket_name,
+                    self.uploaded_files if self.uploaded_files else [self.uploaded_folder],
+                    is_folder=bool(self.uploaded_folder)
+                )
+
+            self.st.divider()
+
+            self.st.header("Upload files from GCS")
+            self.gcs_uris = self.st.text_area(
+                "GCS uris (comma-separated)",
+                value=self.st.session_state["gcs_uris_to_be_sent"],
+                key=f"upload_text_area_{self.st.session_state.uploader_key}",
+                help=HELP_MESSAGE_MULTIMODALITY,
+            )
+
+            self.st.caption(f"Note: {HELP_MESSAGE_MULTIMODALITY}")
+
+
+# ======= File: streamlit/streamlit_app.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# pylint: disable=E0611
+
+from functools import partial
+import json
+from typing import Any, Dict, List
+import uuid
+
+from langchain_core.messages import HumanMessage
+from side_bar import SideBar
+import streamlit as st
+from streamlit_feedback import streamlit_feedback
+from style.app_markdown import MARKDOWN_STR
+from utils.local_chat_history import LocalChatMessageHistory
+from utils.message_editing import MessageEditing
+from utils.multimodal_utils import format_content, get_parts_from_files
+from utils.stream_handler import Client, StreamHandler, get_chain_response
+
+USER = "my_user"
+EMPTY_CHAT_NAME = "Empty chat"
+
+
+def setup_page() -> None:
+    """Configure the Streamlit page settings."""
+    st.set_page_config(
+        page_title="Playground",
+        layout="wide",
+        initial_sidebar_state="auto",
+        menu_items=None,
+    )
+    st.title("Playground")
+    st.markdown(MARKDOWN_STR, unsafe_allow_html=True)
+
+
+def initialize_session_state() -> None:
+    """Initialize the session state with default values."""
+    if "user_chats" not in st.session_state:
+        st.session_state["session_id"] = str(uuid.uuid4())
+        st.session_state.uploader_key = 0
+        st.session_state.run_id = None
+        st.session_state.user_id = USER
+        st.session_state["gcs_uris_to_be_sent"] = ""
+        st.session_state.modified_prompt = None
+        st.session_state.session_db = LocalChatMessageHistory(
+            session_id=st.session_state["session_id"],
+            user_id=st.session_state["user_id"],
+        )
+        st.session_state.user_chats = (
+            st.session_state.session_db.get_all_conversations()
+        )
+        st.session_state.user_chats[st.session_state["session_id"]] = {
+            "title": EMPTY_CHAT_NAME,
+            "messages": [],
+        }
+
+
+def display_messages() -> None:
+    """Display all messages in the current chat session."""
+    messages = st.session_state.user_chats[st.session_state["session_id"]]["messages"]
+    tool_call_input = None
+    for i, message in enumerate(messages):
+        if message["type"] in ["ai", "human"] and message["content"]:
+            display_chat_message(message, i)
+        elif "tool_calls" in message and message["tool_calls"]:
+            tool_call_input = handle_tool_call(message)
+        elif message["type"] == "tool" and tool_call_input is not None:
+            display_tool_output(tool_call_input, message)
+            tool_call_input = None
+        else:
+            st.error(f"Unexpected message type: {message['type']}")
+            st.write("Full messages list:", messages)
+            raise ValueError(f"Unexpected message type: {message['type']}")
+
+
+def display_chat_message(message: Dict[str, Any], index: int) -> None:
+    """Display a single chat message with edit, refresh, and delete options."""
+    chat_message = st.chat_message(message["type"])
+    with chat_message:
+        st.markdown(format_content(message["content"]), unsafe_allow_html=True)
+        col1, col2, col3 = st.columns([2, 2, 94])
+        display_message_buttons(message, index, col1, col2, col3)
+
+
+def display_message_buttons(
+    message: Dict[str, Any], index: int, col1: Any, col2: Any, col3: Any
+) -> None:
+    """Display edit, refresh, and delete buttons for a chat message."""
+    edit_button = f"{index}_edit"
+    refresh_button = f"{index}_refresh"
+    delete_button = f"{index}_delete"
+    content = (
+        message["content"]
+        if isinstance(message["content"], str)
+        else message["content"][-1]["text"]
+    )
+
+    with col1:
+        st.button(label="✎", key=edit_button, type="primary")
+    if message["type"] == "human":
+        with col2:
+            st.button(
+                label="⟳",
+                key=refresh_button,
+                type="primary",
+                on_click=partial(MessageEditing.refresh_message, st, index, content),
+            )
+        with col3:
+            st.button(
+                label="X",
+                key=delete_button,
+                type="primary",
+                on_click=partial(MessageEditing.delete_message, st, index),
+            )
+
+    if st.session_state[edit_button]:
+        st.text_area(
+            "Edit your message:",
+            value=content,
+            key=f"edit_box_{index}",
+            on_change=partial(MessageEditing.edit_message, st, index, message["type"]),
+        )
+
+
+def handle_tool_call(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Process a tool call message and return the first tool call."""
+    if len(message["tool_calls"]) > 1:
+        raise ValueError("Expected only one tool call, but found multiple.")
+    return message["tool_calls"][0]
+
+
+def display_tool_output(
+    tool_call_input: Dict[str, Any], tool_call_output: Dict[str, Any]
+) -> None:
+    """Display the input and output of a tool call in an expander."""
+    tool_expander = st.expander(label="Tool Calls:", expanded=False)
+    with tool_expander:
+        msg = (
+            f"\n\nEnding tool: `{tool_call_input['name']}` with\n **args:**\n"
+            f"```\n{json.dumps(tool_call_input['args'], indent=2)}\n```\n"
+            f"\n\n**output:**\n "
+            f"```\n{json.dumps(tool_call_output, indent=2)}\n```"
+        )
+        st.markdown(msg, unsafe_allow_html=True)
+
+
+def handle_user_input(side_bar: SideBar) -> None:
+    """Process user input, generate AI response, and update chat history."""
+    prompt = st.chat_input() or st.session_state.modified_prompt
+    if prompt:
+        st.session_state.modified_prompt = None
+        parts = get_parts_from_files(
+            upload_gcs_checkbox=st.session_state.checkbox_state,
+            uploaded_files=side_bar.uploaded_files,
+            gcs_uris=side_bar.gcs_uris,
+        )
+        st.session_state["gcs_uris_to_be_sent"] = ""
+        parts.append({"type": "text", "text": prompt})
+        st.session_state.user_chats[st.session_state["session_id"]]["messages"].append(
+            HumanMessage(content=parts).model_dump()
+        )
+
+        display_user_input(parts)
+        generate_ai_response(
+            url_input_field=side_bar.url_input_field,
+            should_authenticate_request=side_bar.should_authenticate_request,
+        )
+        update_chat_title()
+        if len(parts) > 1:
+            st.session_state.uploader_key += 1
+        st.rerun()
+
+
+def display_user_input(parts: List[Dict[str, Any]]) -> None:
+    """Display the user's input in the chat interface."""
+    human_message = st.chat_message("human")
+    with human_message:
+        existing_user_input = format_content(parts)
+        st.markdown(existing_user_input, unsafe_allow_html=True)
+
+
+def generate_ai_response(
+    url_input_field: str, should_authenticate_request: bool
+) -> None:
+    """Generate and display the AI's response to the user's input."""
+    ai_message = st.chat_message("ai")
+    with ai_message:
+        status = st.status("Generating answer🤖")
+        stream_handler = StreamHandler(st=st)
+        client = Client(
+            url=url_input_field, authenticate_request=should_authenticate_request
+        )
+        get_chain_response(st=st, client=client, stream_handler=stream_handler)
+        status.update(label="Finished!", state="complete", expanded=False)
+
+
+def update_chat_title() -> None:
+    """Update the chat title if it's currently empty."""
+    if (
+        st.session_state.user_chats[st.session_state["session_id"]]["title"]
+        == EMPTY_CHAT_NAME
+    ):
+        st.session_state.session_db.set_title(
+            st.session_state.user_chats[st.session_state["session_id"]]
+        )
+    st.session_state.session_db.upsert_session(
+        st.session_state.user_chats[st.session_state["session_id"]]
+    )
+
+
+def display_feedback(side_bar: SideBar) -> None:
+    """Display a feedback component and log the feedback if provided."""
+    if st.session_state.run_id is not None:
+        feedback = streamlit_feedback(
+            feedback_type="faces",
+            optional_text_label="[Optional] Please provide an explanation",
+            key=f"feedback-{st.session_state.run_id}",
+        )
+        if feedback is not None:
+            client = Client(
+                url=side_bar.url_input_field,
+                authenticate_request=side_bar.should_authenticate_request,
+            )
+            client.log_feedback(
+                feedback_dict=feedback,
+                run_id=st.session_state.run_id,
+            )
+
+
+def main() -> None:
+    """Main function to set up and run the Streamlit app."""
+    setup_page()
+    initialize_session_state()
+    side_bar = SideBar(st=st)
+    side_bar.init_side_bar()
+    display_messages()
+    handle_user_input(side_bar=side_bar)
+    display_feedback(side_bar=side_bar)
+
+
+if __name__ == "__main__":
+    main()
+
+
+# ======= File: streamlit/utils/chat_utils.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# pylint: disable=R0801
+
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Union
+
+import yaml
+
+SAVED_CHAT_PATH = str(os.getcwd()) + "/.saved_chats"
+
+
+def clean_text(text: str) -> str:
+    """Preprocess the input text by removing leading and trailing newlines."""
+    if not text:
+        return text
+
+    if text.startswith("\n"):
+        text = text[1:]
+    if text.endswith("\n"):
+        text = text[:-1]
+    return text
+
+
+def sanitize_messages(
+    messages: List[Dict[str, Union[str, List[Dict[str, str]]]]]
+) -> List[Dict[str, Union[str, List[Dict[str, str]]]]]:
+    """Preprocess and fix the content of messages."""
+    for message in messages:
+        if isinstance(message["content"], list):
+            for part in message["content"]:
+                if part["type"] == "text":
+                    part["text"] = clean_text(part["text"])
+        else:
+            message["content"] = clean_text(message["content"])
+    return messages
+
+
+def save_chat(st: Any) -> None:
+    """Save the current chat session to a YAML file."""
+    Path(SAVED_CHAT_PATH).mkdir(parents=True, exist_ok=True)
+    session_id = st.session_state["session_id"]
+    session = st.session_state.user_chats[session_id]
+    messages = session.get("messages", [])
+    if len(messages) > 0:
+        session["messages"] = sanitize_messages(session["messages"])
+        filename = f"{session_id}.yaml"
+        with open(Path(SAVED_CHAT_PATH) / filename, "w") as file:
+            yaml.dump(
+                [session],
+                file,
+                allow_unicode=True,
+                default_flow_style=False,
+                encoding="utf-8",
+            )
+        st.toast(f"Chat saved to path: ↓ {Path(SAVED_CHAT_PATH) / filename}")
+
+
+# ======= File: streamlit/utils/local_chat_history.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# pylint: disable=E0611
+
+from datetime import datetime
+import os
+from typing import Dict
+
+from langchain_core.chat_history import BaseChatMessageHistory
+from utils.title_summary import chain_title
+import yaml
+
+
+class LocalChatMessageHistory(BaseChatMessageHistory):
+    """Manages local storage and retrieval of chat message history."""
+
+    def __init__(
+        self,
+        user_id: str,
+        session_id: str = "default",
+        base_dir: str = ".streamlit_chats",
+    ) -> None:
+        self.user_id = user_id
+        self.session_id = session_id
+        self.base_dir = base_dir
+        self.user_dir = os.path.join(self.base_dir, self.user_id)
+        self.session_file = os.path.join(self.user_dir, f"{session_id}.yaml")
+
+        os.makedirs(self.user_dir, exist_ok=True)
+
+    def get_session(self, session_id: str) -> None:
+        """Updates the session ID and file path for the current session."""
+        self.session_id = session_id
+        self.session_file = os.path.join(self.user_dir, f"{session_id}.yaml")
+
+    def get_all_conversations(self) -> Dict[str, Dict]:
+        """Retrieves all conversations for the current user."""
+        conversations = {}
+        for filename in os.listdir(self.user_dir):
+            if filename.endswith(".yaml"):
+                file_path = os.path.join(self.user_dir, filename)
+                with open(file_path, "r") as f:
+                    conversation = yaml.safe_load(f)
+                    if not isinstance(conversation, list) or len(conversation) > 1:
+                        raise ValueError(
+                            f"""Invalid format in {file_path}.
+                        YAML file can only contain one conversation with the following
+                        structure.
+                          - messages:
+                              - content: [message text]
+                              - type: (human or ai)"""
+                        )
+                    conversation = conversation[0]
+                    if "title" not in conversation:
+                        conversation["title"] = filename
+                conversations[filename[:-5]] = conversation
+        return dict(
+            sorted(conversations.items(), key=lambda x: x[1].get("update_time", ""))
+        )
+
+    def upsert_session(self, session: Dict) -> None:
+        """Updates or inserts a session into the local storage."""
+        session["update_time"] = datetime.now().isoformat()
+        with open(self.session_file, "w") as f:
+            yaml.dump(
+                [session],
+                f,
+                allow_unicode=True,
+                default_flow_style=False,
+                encoding="utf-8",
+            )
+
+    def set_title(self, session: Dict) -> None:
+        """
+        Set the title for the given session.
+
+        This method generates a title for the session based on its messages.
+        If the session has messages, it appends a special message to prompt
+        for title creation, generates the title using a title chain, and
+        updates the session with the new title.
+
+        Args:
+            session (dict): A dictionary containing session information,
+                            including messages.
+
+        Returns:
+            None
+        """
+        if session["messages"]:
+            messages = session["messages"] + [
+                {
+                    "type": "human",
+                    "content": "End of conversation - Create one single title",
+                }
+            ]
+            # Remove the tool calls from conversation
+            messages = [
+                msg
+                for msg in messages
+                if msg["type"] in ("ai", "human") and msg["content"]
+            ]
+
+            title = chain_title.invoke(messages).content.strip()
+            session["title"] = title
+            self.upsert_session(session)
+
+    def clear(self) -> None:
+        """Removes the current session file if it exists."""
+        if os.path.exists(self.session_file):
+            os.remove(self.session_file)
+
+
+# ======= File: streamlit/utils/message_editing.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# fmt: off
+
+from typing import Any
+
+
+class MessageEditing:
+    """Provides methods for editing, refreshing, and deleting chat messages."""
+
+    @staticmethod
+    def edit_message(st: Any, button_idx: int, message_type: str) -> None:
+        """Edit a message in the chat history."""
+        button_id = f"edit_box_{button_idx}"
+        if message_type == "human":
+            messages = st.session_state.user_chats[st.session_state["session_id"]][
+                "messages"
+            ]
+            st.session_state.user_chats[st.session_state["session_id"]][
+                "messages"
+            ] = messages[:button_idx]
+            st.session_state.modified_prompt = st.session_state[button_id]
+        else:
+            st.session_state.user_chats[st.session_state["session_id"]]["messages"][
+                button_idx
+            ]["content"] = st.session_state[button_id]
+
+    @staticmethod
+    def refresh_message(st: Any, button_idx: int, content: str) -> None:
+        """Refresh a message in the chat history."""
+        messages = st.session_state.user_chats[st.session_state["session_id"]][
+            "messages"
+        ]
+        st.session_state.user_chats[st.session_state["session_id"]][
+            "messages"
+        ] = messages[:button_idx]
+        st.session_state.modified_prompt = content
+
+    @staticmethod
+    def delete_message(st: Any, button_idx: int) -> None:
+        """Delete a message from the chat history."""
+        messages = st.session_state.user_chats[st.session_state["session_id"]][
+            "messages"
+        ]
+        st.session_state.user_chats[st.session_state["session_id"]][
+            "messages"
+        ] = messages[:button_idx]
+
+
+# ======= File: streamlit/utils/multimodal_utils.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# pylint: disable=W0718
+
+import base64
+import io
+import zipfile
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import quote
+
+from google.cloud import storage
+
+HELP_MESSAGE_MULTIMODALITY = (
+    "For Gemini models to access the URIs you provide, store them in "
+    "Google Cloud Storage buckets within the same project used by Gemini."
+)
+
+HELP_GCS_CHECKBOX = (
+    "Enabling GCS upload will increase the app observability by avoiding"
+    " forwarding and logging large byte strings within the app."
+)
+
+SUPPORTED_EXTENSIONS = {
+    'pdf', 'md', 'markdown', 'txt', 'docx', 'rtf',
+    'png', 'jpg', 'jpeg', 'csv', 'tsv', 'xlsx'
+}
+
+def process_folder_files(zip_file: Any) -> List[Dict[str, Any]]:
+    """Process files from a zip archive.
+    
+    Args:
+        zip_file: A Streamlit UploadedFile containing a zip archive
+        
+    Returns:
+        List of dictionaries containing file data and metadata
+    """
+    processed_files = []
+    with zipfile.ZipFile(io.BytesIO(zip_file.read()), 'r') as zip_ref:
+        # Get list of files in zip
+        file_list = [f for f in zip_ref.namelist() 
+                    if not f.startswith('__MACOSX') and not f.startswith('.')]
+        
+        # Process each file
+        for filename in file_list:
+            ext = filename.split('.')[-1].lower() if '.' in filename else ''
+            
+            # Skip unsupported files
+            if ext not in SUPPORTED_EXTENSIONS:
+                continue
+                
+            with zip_ref.open(filename) as file:
+                file_data = file.read()
+                
+                # Determine mime type based on extension
+                mime_type = 'application/pdf' if ext == 'pdf' else \
+                          'text/markdown' if ext in ['md', 'markdown'] else \
+                          'text/plain' if ext == 'txt' else \
+                          f'application/{ext}'
+                
+                processed_files.append({
+                    'name': filename,
+                    'data': file_data,
+                    'type': mime_type
+                })
+    
+    return processed_files
+
+def get_gcs_blob_mime_type(gcs_uri: str) -> Optional[str]:
+    """Fetches the MIME type (content type) of a Google Cloud Storage blob.
+
+    Args:
+        gcs_uri (str): The GCS URI of the blob in the format "gs://bucket-name/object-name".
+
+    Returns:
+        str: The MIME type of the blob (e.g., "image/jpeg", "text/plain") if found,
+             or None if the blob does not exist or an error occurs.
+    """
+    storage_client = storage.Client()
+
+    try:
+        bucket_name, object_name = gcs_uri.replace("gs://", "").split("/", 1)
+
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(object_name)
+        blob.reload()
+        return blob.content_type
+    except Exception as e:
+        print(f"Error retrieving MIME type for {gcs_uri}: {e}")
+        return None  # Indicate failure
+
+def get_parts_from_files(
+    upload_gcs_checkbox: bool, uploaded_files: List[Any], gcs_uris: str
+) -> List[Dict[str, Any]]:
+    """Processes uploaded files and GCS URIs to create a list of content parts."""
+    parts = []
+    # read from local directly
+    if not upload_gcs_checkbox:
+        for uploaded_file in uploaded_files:
+            im_bytes = uploaded_file.read()
+            if "image" in uploaded_file.type:
+                content = {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{uploaded_file.type};base64,"
+                        f"{base64.b64encode(im_bytes).decode('utf-8')}"
+                    },
+                    "file_name": uploaded_file.name,
+                }
+            elif uploaded_file.type in ["text/markdown", "text/md"] or uploaded_file.name.endswith((".md", ".markdown")):
+                content = {
+                    "type": "media",
+                    "data": base64.b64encode(im_bytes).decode("utf-8"),
+                    "file_name": uploaded_file.name,
+                    "mime_type": "text/markdown",
+                }
+            else:
+                content = {
+                    "type": "media",
+                    "data": base64.b64encode(im_bytes).decode("utf-8"),
+                    "file_name": uploaded_file.name,
+                    "mime_type": uploaded_file.type,
+                }
+
+            parts.append(content)
+    if gcs_uris != "":
+        for uri in gcs_uris.split(","):
+            content = {
+                "type": "media",
+                "file_uri": uri,
+                "mime_type": get_gcs_blob_mime_type(uri),
+            }
+            parts.append(content)
+    return parts
+
+def upload_bytes_to_gcs(
+    bucket_name: str,
+    blob_name: str,
+    file_bytes: bytes,
+    content_type: Optional[str] = None,
+) -> str:
+    """Uploads a bytes object to Google Cloud Storage and returns the GCS URI.
+
+    Args:
+        bucket_name: The name of the GCS bucket.
+        blob_name: The desired name for the uploaded file in GCS.
+        file_bytes: The file's content as a bytes object.
+        content_type (optional): The MIME type of the file (e.g., "image/png").
+            If not provided, GCS will try to infer it.
+
+    Returns:
+        str: The GCS URI (gs://bucket_name/blob_name) of the uploaded file.
+
+    Raises:
+        GoogleCloudError: If there's an issue with the GCS operation.
+    """
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_string(data=file_bytes, content_type=content_type)
+    # Construct and return the GCS URI
+    gcs_uri = f"gs://{bucket_name}/{blob_name}"
+    return gcs_uri
+
+def gs_uri_to_https_url(gs_uri: str) -> str:
+    """Converts a GS URI to an HTTPS URL without authentication.
+
+    Args:
+        gs_uri: The GS URI in the format gs://<bucket>/<object>.
+
+    Returns:
+        The corresponding HTTPS URL, or None if the GS URI is invalid.
+    """
+
+    if not gs_uri.startswith("gs://"):
+        raise ValueError("Invalid GS URI format")
+
+    gs_uri = gs_uri[5:]
+
+    # Extract bucket and object names, then URL encode the object name
+    bucket_name, object_name = gs_uri.split("/", 1)
+    object_name = quote(object_name)
+
+    # Construct the HTTPS URL
+    https_url = f"https://storage.mtls.cloud.google.com/{bucket_name}/{object_name}"
+    return https_url
+
+def upload_files_to_gcs(
+    st: Any, 
+    bucket_name: str, 
+    files_to_upload: List[Any],
+    is_folder: bool = False
+) -> None:
+    """Upload multiple files to Google Cloud Storage and store URIs in session state."""
+    bucket_name = bucket_name.replace("gs://", "")
+    uploaded_uris = []
+    
+    if is_folder and files_to_upload:
+        # Process zip file
+        processed_files = process_folder_files(files_to_upload[0])
+        total_files = len(processed_files)
+        st.info(f"Found {total_files} valid files in the folder")
+        
+        for file_info in processed_files:
+            gcs_uri = upload_bytes_to_gcs(
+                bucket_name=bucket_name,
+                blob_name=file_info['name'],
+                file_bytes=file_info['data'],
+                content_type=file_info['type'],
+            )
+            uploaded_uris.append(gcs_uri)
+            
+    else:
+        # Regular file upload
+        for file in files_to_upload:
+            if file:
+                file_bytes = file.read()
+                gcs_uri = upload_bytes_to_gcs(
+                    bucket_name=bucket_name,
+                    blob_name=file.name,
+                    file_bytes=file_bytes,
+                    content_type=file.type,
+                )
+                uploaded_uris.append(gcs_uri)
+                
+    st.session_state.uploader_key += 1
+    st.session_state["gcs_uris_to_be_sent"] = ",".join(uploaded_uris)
+    
+    if uploaded_uris:
+        st.success(f"Successfully uploaded {len(uploaded_uris)} files to GCS")
+
+def format_content(content: Union[str, List[Dict[str, Any]]]) -> str:
+    """Formats content as a string, handling both text and multimedia inputs."""
+    if isinstance(content, str):
+        return content
+    if len(content) == 1 and content[0]["type"] == "text":
+        return content[0]["text"]
+    markdown = """Media:
+"""
+    text = ""
+    for part in content:
+        if part["type"] == "text":
+            text = part["text"]
+        # Local Images:
+        if part["type"] == "image_url":
+            image_url = part["image_url"]["url"]
+            image_markdown = f'<img src="{image_url}" width="100">'
+            markdown = (
+                markdown
+                + f"""
+- {image_markdown}
+"""
+            )
+        if part["type"] == "media":
+            # Local other media
+            if "data" in part:
+                markdown = markdown + f"- Local media: {part['file_name']}\n"
+            # From GCS:
+            if "file_uri" in part:
+                # GCS images
+                if "image" in part["mime_type"]:
+                    image_url = gs_uri_to_https_url(part["file_uri"])
+                    image_markdown = f'<img src="{image_url}" width="100">'
+                    markdown = (
+                        markdown
+                        + f"""
+- {image_markdown}
+"""
+                    )
+                # GCS other media
+                else:
+                    image_url = gs_uri_to_https_url(part["file_uri"])
+                    markdown = (
+                        markdown + f"- Remote media: "
+                        f"[{part['file_uri']}]({image_url})\n"
+                    )
+    markdown = (
+        markdown
+        + f"""
+
+{text}"""
+    )
+    return markdown
+
+
+# ======= File: streamlit/utils/stream_handler.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# pylint: disable=W0621,W0613,W3101,E0611
+
+import json
+from typing import Any, Dict, Generator, List, Optional
+from urllib.parse import urljoin
+
+import google.auth
+from google.auth.exceptions import DefaultCredentialsError
+import google.auth.transport.requests
+import google.oauth2.id_token
+from langchain_core.messages import AIMessage, ToolMessage
+import requests
+import streamlit as st
+from utils.multimodal_utils import format_content
+
+
+@st.cache_resource()
+class Client:
+    """A client for streaming events from a server."""
+
+    def __init__(self, url: str, authenticate_request: bool = False) -> None:
+        """Initialize the Client with a base URL."""
+        self.url = urljoin(url, "stream_events")
+        self.authenticate_request = authenticate_request
+        self.creds, _ = google.auth.default()
+
+        if self.authenticate_request:
+            self.id_token = self.get_id_token(self.url)
+
+    def get_id_token(self, url: str) -> str:
+        """
+        Retrieves an ID token, attempting to use a service-to-service method first and
+        otherwise using user default credentials.
+        See more on Cloud Run authentication at this link:
+         https://cloud.google.com/run/docs/authenticating/service-to-service
+        Args:
+            url: The URL to use for the token request.
+        """
+
+        auth_req = google.auth.transport.requests.Request()
+        try:
+            token = google.oauth2.id_token.fetch_id_token(auth_req, url)
+        except DefaultCredentialsError:
+            self.creds.refresh(auth_req)
+            token = self.creds.id_token
+        return token
+
+    def log_feedback(self, feedback_dict: Dict[str, Any], run_id: str) -> None:
+        """Log user feedback for a specific run."""
+        score = feedback_dict["score"]
+        if score == "😞":
+            score = 0.0
+        elif score == "🙁":
+            score = 0.25
+        elif score == "😐":
+            score = 0.5
+        elif score == "🙂":
+            score = 0.75
+        elif score == "😀":
+            score = 1.0
+        feedback_dict["score"] = score
+        feedback_dict["run_id"] = run_id
+        feedback_dict["log_type"] = "feedback"
+        feedback_dict.pop("type")
+        url = urljoin(self.url, "feedback")
+        headers = {
+            "Content-Type": "application/json",
+        }
+        if self.authenticate_request:
+            headers["Authorization"] = f"Bearer {self.id_token}"
+        requests.post(url, data=json.dumps(feedback_dict), headers=headers)
+
+    def stream_events(
+        self, data: Dict[str, Any]
+    ) -> Generator[Dict[str, Any], None, None]:
+        """Stream events from the server, yielding parsed event data."""
+        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+        if self.authenticate_request:
+            headers["Authorization"] = f"Bearer {self.id_token}"
+        with requests.post(
+            self.url, json={"input": data}, headers=headers, stream=True
+        ) as response:
+            for line in response.iter_lines():
+                if line:
+                    try:
+                        event = json.loads(line.decode("utf-8"))
+                        yield event
+                    except json.JSONDecodeError:
+                        print(f"Failed to parse event: {line.decode('utf-8')}")
+
+
+class StreamHandler:
+    """Handles streaming updates to a Streamlit interface."""
+
+    def __init__(self, st: Any, initial_text: str = "") -> None:
+        """Initialize the StreamHandler with Streamlit context and initial text."""
+        self.st = st
+        self.tool_expander = st.expander("Tool Calls:", expanded=False)
+        self.container = st.empty()
+        self.text = initial_text
+        self.tools_logs = initial_text
+
+    def new_token(self, token: str) -> None:
+        """Add a new token to the main text display."""
+        self.text += token
+        self.container.markdown(format_content(self.text), unsafe_allow_html=True)
+
+    def new_status(self, status_update: str) -> None:
+        """Add a new status update to the tool calls expander."""
+        self.tools_logs += status_update
+        self.tool_expander.markdown(status_update)
+
+
+class EventProcessor:
+    """Processes events from the stream and updates the UI accordingly."""
+
+    def __init__(self, st: Any, client: Client, stream_handler: StreamHandler) -> None:
+        """Initialize the EventProcessor with Streamlit context, client, and stream handler."""
+        self.st = st
+        self.client = client
+        self.stream_handler = stream_handler
+        self.final_content = ""
+        self.tool_calls: List[Dict[str, Any]] = []
+        self.additional_kwargs: Dict[str, Any] = {}
+        self.current_run_id: Optional[str] = None
+
+    def process_events(self) -> None:
+        """Process events from the stream, handling each event type appropriately."""
+        messages = self.st.session_state.user_chats[
+            self.st.session_state["session_id"]
+        ]["messages"]
+        stream = self.client.stream_events(
+            data={
+                "messages": messages,
+                "user_id": self.st.session_state["user_id"],
+                "session_id": self.st.session_state["session_id"],
+            }
+        )
+
+        event_handlers = {
+            "metadata": self.handle_metadata,
+            "end": self.handle_end,
+            "on_tool_start": self.handle_tool_start,
+            "on_retriever_start": self.handle_tool_start,
+            "on_tool_end": self.handle_tool_end,
+            "on_retriever_end": self.handle_retriever_end,
+            "on_chat_model_stream": self.handle_chat_model_stream,
+        }
+
+        for event in stream:
+            event_type = str(event.get("event"))
+            handler = event_handlers.get(event_type)
+            if handler:
+                handler(event)
+
+    def handle_metadata(self, event: Dict[str, Any]) -> None:
+        """Handle metadata events."""
+        self.current_run_id = event["data"].get("run_id")
+
+    def handle_tool_start(self, event: Dict[str, Any]) -> None:
+        """Handle the start of a tool or retriever execution."""
+        msg = (
+            f"\n\nCalling tool: `{event['name']}` with args: `{event['data']['input']}`"
+        )
+        self.stream_handler.new_status(msg)
+
+    def handle_retriever_end(self, event: Dict[str, Any]) -> None:
+        """Handle the end of retriever execution.
+
+        This method processes the completion of a retriever operation. Unlike the
+        handle_tool_end method, it doesn't append new messages to the session by default
+        as it wouldn't be supported by the server by default.
+        If appending messages is required, the approach used in handle_tool_end can be
+        replicated here.
+        """
+        data = event["data"]
+
+        tool_name = event.get("name", event["event"])
+        tool_output = {"tool_call_id": tool_name, "content": data["output"]}
+        tool_input = data["input"]
+        msg = (
+            f"\n\nEnding tool: `{tool_name}` with\n **args:**\n"
+            f"```\n{json.dumps(tool_input, indent=2)}\n```\n"
+            f"\n\n**output:**\n "
+            f"```\n{json.dumps(tool_output, indent=2)}\n```"
+        )
+        self.stream_handler.new_status(msg)
+
+    def handle_tool_end(self, event: Dict[str, Any]) -> None:
+        """Handle the end of a tool execution."""
+        data = event["data"]
+
+        tool_id = data["output"].get("tool_call_id")
+        tool_name = data["output"].get("name")
+        tool_input = data["input"]
+        tool_output = data["output"]
+
+        tool_call_input = AIMessage(
+            content="",
+            tool_calls=[{"id": tool_id, "name": tool_name, "args": tool_input}],
+        )
+        tool_call_output = ToolMessage(**tool_output)
+        self.tool_calls.append(tool_call_input.model_dump())
+        self.tool_calls.append(tool_call_output.model_dump())
+        msg = (
+            f"\n\nEnding tool: `{tool_name}` with\n **args:**\n"
+            f"```\n{json.dumps(tool_input, indent=2)}\n```\n"
+            f"\n\n**output:**\n "
+            f"```\n{json.dumps(tool_output, indent=2)}\n```"
+        )
+        self.stream_handler.new_status(msg)
+
+    def handle_chat_model_stream(self, event: Dict[str, Any]) -> None:
+        """Handle incoming tokens from the chat model stream."""
+        data = event["data"]
+        content = data["chunk"]["content"]
+        self.additional_kwargs = {
+            **self.additional_kwargs,
+            **data["chunk"]["additional_kwargs"],
+        }
+        if content and len(content.strip()) > 0:
+            self.final_content += content
+            self.stream_handler.new_token(content)
+
+    def handle_end(self, event: Dict[str, Any]) -> None:
+        """Handle the end of the event stream and finalize the response."""
+        final_message = AIMessage(
+            content=self.final_content,
+            id=self.current_run_id,
+            additional_kwargs=self.additional_kwargs,
+        ).model_dump()
+        session = self.st.session_state["session_id"]
+        self.st.session_state.user_chats[session]["messages"] = (
+            self.st.session_state.user_chats[session]["messages"] + self.tool_calls
+        )
+        self.st.session_state.user_chats[session]["messages"].append(final_message)
+        self.st.session_state.run_id = self.current_run_id
+
+
+def get_chain_response(st: Any, client: Client, stream_handler: StreamHandler) -> None:
+    """Process the chain response update the Streamlit UI.
+
+    This function initiates the event processing for a chain of operations,
+     involving an AI model's response generation and potential tool calls.
+    It creates an EventProcessor instance and starts the event processing loop.
+
+    Args:
+        st (Any): The Streamlit app instance, used for accessing session state
+                        and updating the UI.
+        client (Client): An instance of the Client class used to stream events
+                         from the server.
+        stream_handler (StreamHandler): An instance of the StreamHandler class
+                                        used to update the Streamlit UI with
+                                        streaming content.
+
+    Returns:
+        None
+
+    Side effects:
+        - Updates the Streamlit UI with streaming tokens and tool call information.
+        - Modifies the session state to include the final AI message and run ID.
+        - Handles various events like chain starts/ends, tool calls, and model outputs.
+    """
+    processor = EventProcessor(st, client, stream_handler)
+    processor.process_events()
+
+
+# ======= File: streamlit/utils/title_summary.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# fmt: off
+# ruff: noqa: E501
+# flake8: noqa: W291
+
+
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_google_vertexai import ChatVertexAI
+
+llm = ChatVertexAI(model_name="gemini-1.5-flash-001", temperature=0)
+
+title_template = ChatPromptTemplate.from_messages(
+    [("system", """Given a list of messages between a human and AI, come up with a short and relevant title for the conversation. Use up to 10 words. The title needs to be concise.
+Examples:
+**Input:**
+```
+Human: hi, what is the best italian dish?
+AI: That's a tough one! Italy has so many amazing dishes, it's hard to pick just one "best." To help me give you a great suggestion, tell me a little more about what you're looking for.
+```
+**Output:** Best italian dish
+
+**Input:**
+
+```
+Human: How to fix a broken laptop screen?
+AI: Fixing a broken laptop screen can be tricky and often requires professional help. However, there are a few things you can try at home before resorting to a repair shop. 
+```
+
+**Output:** Fixing a broken laptop screen
+
+**Input:**
+
+```
+Human: Can you write me a poem about the beach?
+AI: As the sun dips down below the horizon
+And the waves gently kiss the shore,
+I sit here and watch the ocean
+And feel its power evermore.
+```
+
+**Output:** Poem about the beach
+
+**Input:**
+
+```
+Human: What's the best way to learn to code?
+AI: There are many ways to learn to code, and the best method for you will depend on your learning style and goals. 
+```
+
+**Output:** How to learn to code
+"""),
+
+     MessagesPlaceholder(variable_name="messages"),
+     ])
+
+chain_title = title_template | llm
+
+
+# ======= File: streamlit/style/app_markdown.py =======
+
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+MARKDOWN_STR = """
+<style>
+button[kind="primary"] {
+    background: none!important;
+    border: 0;
+    padding: 20!important;
+    color: grey !important;
+    text-decoration: none;
+    cursor: pointer;
+    border: none !important;
+    # float: right;
+}
+button[kind="primary"]:hover {
+    text-decoration: none;
+    color: white !important;
+}
+button[kind="primary"]:focus {
+    outline: none !important;
+    box-shadow: none !important;
+    color:  !important;
+}
+</style>
+"""
