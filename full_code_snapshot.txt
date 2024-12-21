@@ -148,7 +148,9 @@ import os
 from typing import AsyncGenerator
 import uuid
 
-from app.chain import chain
+# Import the mirror agent chain
+from app.patterns.mirror_agent.chain import chain
+
 from app.utils.input_types import Feedback, Input, InputChat, default_serialization
 from app.utils.output_types import EndEvent, Event
 from app.utils.tracing import CloudTraceLoggingSpanExporter
@@ -157,18 +159,50 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from google.cloud import logging as google_cloud_logging
 from traceloop.sdk import Instruments, Traceloop
 
-# Default chain
-# from app.chain import chain
+def remove_tool_calls_from_human_messages(messages: list) -> list:
+    """
+    Strip out leftover 'tool_calls' from any HumanMessage in the conversation.
+    This prevents the 'HumanMessage object has no attribute get' error.
+    """
+    from langchain_core.messages import HumanMessage
+    for msg in messages:
+        # If the message is a HumanMessage with leftover tool_calls, remove them
+        if isinstance(msg, HumanMessage) and hasattr(msg, "additional_kwargs"):
+            if "tool_calls" in msg.additional_kwargs:
+                msg.additional_kwargs.pop("tool_calls", None)
+    return messages
 
-# Or choose one of the following pattern chains to test by uncommenting it:
+async def stream_event_response(input_chat: InputChat) -> AsyncGenerator[str, None]:
+    """Stream events in response to an input chat."""
+    run_id = uuid.uuid4()
+    input_dict = input_chat.model_dump()
 
-# Custom RAG QA
-# from app.patterns.custom_rag_qa.chain import chain
+    Traceloop.set_association_properties(
+        {
+            "log_type": "tracing",
+            "run_id": str(run_id),
+            "user_id": input_dict["user_id"],
+            "session_id": input_dict["session_id"],
+            "commit_sha": os.environ.get("COMMIT_SHA", "None"),
+        }
+    )
 
-# LangGraph dummy agent
-# from app.patterns.langgraph_dummy_agent.chain import chain
+    # Sanitize leftover tool_calls on user messages
+    if "messages" in input_dict:
+        input_dict["messages"] = remove_tool_calls_from_human_messages(
+            input_dict["messages"]
+        )
 
-# Or explore other patterns in the 'app/patterns' folder
+    yield json.dumps(
+        Event(event="metadata", data={"run_id": str(run_id)}),
+        default=default_serialization,
+    ) + "\n"
+
+    async for data in chain.astream_events(input_dict, version="v2"):
+        if data["event"] in SUPPORTED_EVENTS:
+            yield json.dumps(data, default=default_serialization) + "\n"
+
+    yield json.dumps(EndEvent(), default=default_serialization) + "\n"
 
 # The events that are supported by the UI Frontend
 SUPPORTED_EVENTS = [
@@ -195,46 +229,16 @@ try:
 except Exception as e:
     logging.error("Failed to initialize Traceloop: %s", e)
 
-
-async def stream_event_response(input_chat: InputChat) -> AsyncGenerator[str, None]:
-    """Stream events in response to an input chat."""
-    run_id = uuid.uuid4()
-    input_dict = input_chat.model_dump()
-
-    Traceloop.set_association_properties(
-        {
-            "log_type": "tracing",
-            "run_id": str(run_id),
-            "user_id": input_dict["user_id"],
-            "session_id": input_dict["session_id"],
-            "commit_sha": os.environ.get("COMMIT_SHA", "None"),
-        }
-    )
-
-    yield json.dumps(
-        Event(event="metadata", data={"run_id": str(run_id)}),
-        default=default_serialization,
-    ) + "\n"
-
-    async for data in chain.astream_events(input_dict, version="v2"):
-        if data["event"] in SUPPORTED_EVENTS:
-            yield json.dumps(data, default=default_serialization) + "\n"
-
-    yield json.dumps(EndEvent(), default=default_serialization) + "\n"
-
-
 # Routes
 @app.get("/")
 async def redirect_root_to_docs() -> RedirectResponse:
     """Redirect the root URL to the API documentation."""
     return RedirectResponse("/docs")
 
-
 @app.post("/feedback")
 async def collect_feedback(feedback_dict: Feedback) -> None:
     """Collect and log feedback."""
     logger.log_struct(feedback_dict.model_dump(), severity="INFO")
-
 
 @app.post("/stream_events")
 async def stream_chat_events(request: Input) -> StreamingResponse:
@@ -242,7 +246,6 @@ async def stream_chat_events(request: Input) -> StreamingResponse:
     return StreamingResponse(
         stream_event_response(input_chat=request.input), media_type="text/event-stream"
     )
-
 
 # Main execution
 if __name__ == "__main__":
@@ -1044,6 +1047,8 @@ from kfp.dsl import component, Dataset, Output, Input
         "langchain-google-vertexai",
         "pypdf",
         "pydantic==2.9.2",
+        "pytesseract",
+        "Pillow",
         "markdown"
     ]
 )
@@ -1057,6 +1062,7 @@ def process_data(
     import json
     import logging
     import uuid
+    import pytesseract
     import vertexai
     from langchain.text_splitter import RecursiveCharacterTextSplitter
     from langchain_community.document_loaders import PyPDFLoader, TextLoader
@@ -1064,6 +1070,24 @@ def process_data(
     from langchain_core.embeddings import Embeddings
     from langchain_google_vertexai import VertexAIEmbeddings
     from typing import List
+
+    class ImageLoader:
+        """Simple loader for image files using OCR."""
+        def __init__(self, file_path: str):
+            self.file_path = file_path
+
+        def load(self) -> List[Document]:
+            # Here we assume the file_path is local or accessible; if it's a GCS path,
+            # you'd download it first. For now, we assume a local path or a mounted volume.
+            # Additional logic may be needed depending on your environment.
+            with open(self.file_path, "rb") as f:
+                img_content = f.read()
+            # OCR with pytesseract
+            from PIL import Image
+            import io
+            image = Image.open(io.BytesIO(img_content))
+            text = pytesseract.image_to_string(image)
+            return [Document(page_content=text, metadata={"source": self.file_path})]
 
     vertexai.init()
     embedding = VertexAIEmbeddings(model_name=embedding_model)
@@ -1074,6 +1098,11 @@ def process_data(
             loader = PyPDFLoader(url)
         elif file_type.lower() in ["md", "markdown", "txt"]:
             loader = TextLoader(url)
+        elif file_type.lower() in ["jpg", "jpeg", "png"]:
+            # For images, use the new ImageLoader defined above
+            # Ensure that `url` is a local or accessible file path
+            # If it's a remote URL, download or access it accordingly before passing to ImageLoader.
+            loader = ImageLoader(url)
         else:
             raise ValueError(f"Unsupported file type: {file_type}")
             
@@ -2034,6 +2063,147 @@ def get_vector_store(
     return vector_store
 
 
+# ======= File: app/patterns/mirror_agent/__init__.py =======
+
+"""Mirror Agent implementation using LangGraph.""" 
+
+# ======= File: app/patterns/mirror_agent/chain.py =======
+
+import os
+from typing import Any, Dict, List, Union, Optional
+
+import google.auth
+import vertexai
+from langchain_core.messages import AIMessage
+from langchain_core.messages import (
+    BaseMessage, HumanMessage, AIMessage, SystemMessage
+)
+from pydantic import BaseModel
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_google_vertexai import ChatVertexAI
+from langgraph.graph import END, StateGraph
+from langgraph.prebuilt import ToolNode
+
+class MirrorAgentState(BaseModel):
+    messages: List[Union[SystemMessage, HumanMessage, AIMessage]] = []
+    memory: Dict[str, Any] = {}
+
+@tool
+def retrieve_user_docs(query: str) -> str:
+    """Retrieve relevant user documents based on the query.
+    
+    Args:
+        query: The search query to find relevant documents.
+        
+    Returns:
+        str: The retrieved document content or search results.
+    """
+    return f"Retrieved docs for query: {query}"
+
+@tool
+def reflect_on_recent_interactions(context: str) -> str:
+    """Analyze and reflect on recent user interactions to provide insights.
+    
+    Args:
+        context: The context or topic to reflect upon.
+        
+    Returns:
+        str: Reflective insights based on the context.
+    """
+    return f"Reflecting on: {context}"
+
+credentials, project_id = google.auth.default()
+vertexai.init(project=project_id)
+
+# Initialize with system message
+system_message = SystemMessage(content=(
+    "You are a wise and helpful mirror agent. You use a Socratic style, "
+    "helping the user to know themselves better."
+))
+
+mirror_system_prompt = ChatPromptTemplate.from_messages(
+    [
+        system_message,
+        MessagesPlaceholder(variable_name="chat_history"),
+    ]
+)
+
+mirror_llm = ChatVertexAI(
+    model_name="gemini-2.0-flash-exp",
+    location="us-central1",
+    temperature=0.7,
+    max_output_tokens=4096,
+    streaming=True,
+)
+
+mirror_agent = mirror_system_prompt | mirror_llm.bind_tools(
+    [retrieve_user_docs, reflect_on_recent_interactions],
+    tool_choice="any"
+)
+
+def mirror_agent_node(state: MirrorAgentState, config: RunnableConfig) -> Dict[str, Any]:
+    """Process the current state and generate a response."""
+    # Convert any BaseMessage items (if they slipped in) to recognized roles.
+    chat_history = []
+    for msg in state.messages:
+        if isinstance(msg, (SystemMessage, HumanMessage, AIMessage)):
+            chat_history.append(msg)
+        else:
+            # If it's a user (HumanMessage) but has leftover tool_calls,
+            # remove them so langchain_core doesn't crash on 'get' attribute.
+            if isinstance(msg, HumanMessage) and hasattr(msg, "additional_kwargs"):
+                msg.additional_kwargs.pop("tool_calls", None)
+
+            # Fallback: treat unknown message type as user input
+            chat_history.append(HumanMessage(content=str(msg.content)))
+
+    response_or_responses = mirror_agent.invoke({"chat_history": chat_history}, config)
+
+    # Sometimes the agent returns a single message, sometimes a list.
+    # Append to our conversation properly.
+    if isinstance(response_or_responses, BaseMessage):
+        state.messages.append(response_or_responses)
+    elif isinstance(response_or_responses, list):
+        for r in response_or_responses:
+            if isinstance(r, BaseMessage):
+                state.messages.append(r)
+            else:
+                # Fallback if a tool returns a raw string or something else
+                state.messages.append(AIMessage(content=str(r)))
+
+    return {"messages": state.messages}
+
+mirror_workflow = StateGraph(MirrorAgentState)
+mirror_workflow.add_node("mirror_agent", mirror_agent_node)
+mirror_workflow.add_node("tools", ToolNode(tools=[retrieve_user_docs, reflect_on_recent_interactions]))
+mirror_workflow.set_entry_point("mirror_agent")
+
+def should_call_tools(state: MirrorAgentState) -> bool:
+    """Check if we should call tools based on the last message."""
+    if not state.messages:
+        return False
+    
+    last_msg = state.messages[-1]
+    if not isinstance(last_msg, AIMessage):
+        return False
+        
+    # Safely check for tool_calls
+    tool_calls = getattr(last_msg, "additional_kwargs", {}).get("tool_calls", [])
+    return bool(tool_calls)
+
+# Add edges with proper tool call handling
+mirror_workflow.add_conditional_edges(
+    "mirror_agent",
+    lambda x: "tools" if should_call_tools(x) else END
+)
+
+# After tools, return to the agent for another round
+mirror_workflow.add_edge("tools", "mirror_agent")
+
+chain = mirror_workflow.compile()
+
 # ======= File: app/utils/__init__.py =======
 
 
@@ -2980,6 +3150,19 @@ def display_tool_output(
         st.markdown(msg, unsafe_allow_html=True)
 
 
+def _sanitize_human_message(msg_dict: dict) -> dict:
+    """
+    Remove leftover 'tool_calls' from a HumanMessage if present.
+    This prevents 'HumanMessage object has no attribute get' errors.
+    """
+    # If 'additional_kwargs' or direct 'tool_calls' keys exist on the dict, remove them
+    additional_kwargs = msg_dict.get("additional_kwargs", {})
+    if "tool_calls" in additional_kwargs:
+        del additional_kwargs["tool_calls"]
+    msg_dict["additional_kwargs"] = additional_kwargs
+    return msg_dict
+
+
 def handle_user_input(side_bar: SideBar) -> None:
     """Process user input, generate AI response, and update chat history."""
     prompt = st.chat_input() or st.session_state.modified_prompt
@@ -2993,7 +3176,7 @@ def handle_user_input(side_bar: SideBar) -> None:
         st.session_state["gcs_uris_to_be_sent"] = ""
         parts.append({"type": "text", "text": prompt})
         st.session_state.user_chats[st.session_state["session_id"]]["messages"].append(
-            HumanMessage(content=parts).model_dump()
+            _sanitize_human_message(HumanMessage(content=parts).model_dump())
         )
 
         display_user_input(parts)

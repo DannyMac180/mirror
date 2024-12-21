@@ -20,7 +20,9 @@ import os
 from typing import AsyncGenerator
 import uuid
 
-from app.chain import chain
+# Import the mirror agent chain
+from app.patterns.mirror_agent.chain import chain
+
 from app.utils.input_types import Feedback, Input, InputChat, default_serialization
 from app.utils.output_types import EndEvent, Event
 from app.utils.tracing import CloudTraceLoggingSpanExporter
@@ -29,18 +31,50 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from google.cloud import logging as google_cloud_logging
 from traceloop.sdk import Instruments, Traceloop
 
-# Default chain
-# from app.chain import chain
+def remove_tool_calls_from_human_messages(messages: list) -> list:
+    """
+    Strip out leftover 'tool_calls' from any HumanMessage in the conversation.
+    This prevents the 'HumanMessage object has no attribute get' error.
+    """
+    from langchain_core.messages import HumanMessage
+    for msg in messages:
+        # If the message is a HumanMessage with leftover tool_calls, remove them
+        if isinstance(msg, HumanMessage) and hasattr(msg, "additional_kwargs"):
+            if "tool_calls" in msg.additional_kwargs:
+                msg.additional_kwargs.pop("tool_calls", None)
+    return messages
 
-# Or choose one of the following pattern chains to test by uncommenting it:
+async def stream_event_response(input_chat: InputChat) -> AsyncGenerator[str, None]:
+    """Stream events in response to an input chat."""
+    run_id = uuid.uuid4()
+    input_dict = input_chat.model_dump()
 
-# Custom RAG QA
-# from app.patterns.custom_rag_qa.chain import chain
+    Traceloop.set_association_properties(
+        {
+            "log_type": "tracing",
+            "run_id": str(run_id),
+            "user_id": input_dict["user_id"],
+            "session_id": input_dict["session_id"],
+            "commit_sha": os.environ.get("COMMIT_SHA", "None"),
+        }
+    )
 
-# LangGraph dummy agent
-# from app.patterns.langgraph_dummy_agent.chain import chain
+    # Sanitize leftover tool_calls on user messages
+    if "messages" in input_dict:
+        input_dict["messages"] = remove_tool_calls_from_human_messages(
+            input_dict["messages"]
+        )
 
-# Or explore other patterns in the 'app/patterns' folder
+    yield json.dumps(
+        Event(event="metadata", data={"run_id": str(run_id)}),
+        default=default_serialization,
+    ) + "\n"
+
+    async for data in chain.astream_events(input_dict, version="v2"):
+        if data["event"] in SUPPORTED_EVENTS:
+            yield json.dumps(data, default=default_serialization) + "\n"
+
+    yield json.dumps(EndEvent(), default=default_serialization) + "\n"
 
 # The events that are supported by the UI Frontend
 SUPPORTED_EVENTS = [
@@ -67,46 +101,16 @@ try:
 except Exception as e:
     logging.error("Failed to initialize Traceloop: %s", e)
 
-
-async def stream_event_response(input_chat: InputChat) -> AsyncGenerator[str, None]:
-    """Stream events in response to an input chat."""
-    run_id = uuid.uuid4()
-    input_dict = input_chat.model_dump()
-
-    Traceloop.set_association_properties(
-        {
-            "log_type": "tracing",
-            "run_id": str(run_id),
-            "user_id": input_dict["user_id"],
-            "session_id": input_dict["session_id"],
-            "commit_sha": os.environ.get("COMMIT_SHA", "None"),
-        }
-    )
-
-    yield json.dumps(
-        Event(event="metadata", data={"run_id": str(run_id)}),
-        default=default_serialization,
-    ) + "\n"
-
-    async for data in chain.astream_events(input_dict, version="v2"):
-        if data["event"] in SUPPORTED_EVENTS:
-            yield json.dumps(data, default=default_serialization) + "\n"
-
-    yield json.dumps(EndEvent(), default=default_serialization) + "\n"
-
-
 # Routes
 @app.get("/")
 async def redirect_root_to_docs() -> RedirectResponse:
     """Redirect the root URL to the API documentation."""
     return RedirectResponse("/docs")
 
-
 @app.post("/feedback")
 async def collect_feedback(feedback_dict: Feedback) -> None:
     """Collect and log feedback."""
     logger.log_struct(feedback_dict.model_dump(), severity="INFO")
-
 
 @app.post("/stream_events")
 async def stream_chat_events(request: Input) -> StreamingResponse:
@@ -114,7 +118,6 @@ async def stream_chat_events(request: Input) -> StreamingResponse:
     return StreamingResponse(
         stream_event_response(input_chat=request.input), media_type="text/event-stream"
     )
-
 
 # Main execution
 if __name__ == "__main__":

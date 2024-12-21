@@ -44,6 +44,21 @@ def setup_page() -> None:
     st.markdown(MARKDOWN_STR, unsafe_allow_html=True)
 
 
+def _remove_tool_calls_from_conversation(messages: List[Dict[str, Any]]) -> None:
+    """
+    Removes leftover 'tool_calls' from any user/human message in a conversation.
+    This prevents the 'HumanMessage' object has no attribute 'get' error
+    once these messages are converted to HumanMessage objects on the backend.
+    """
+    for msg in messages:
+        if msg.get("type") == "human":
+            additional_kwargs = msg.get("additional_kwargs", {})
+            if "tool_calls" in additional_kwargs:
+                del additional_kwargs["tool_calls"]
+            msg["additional_kwargs"] = additional_kwargs
+    # No return needed; modifies messages in place
+
+
 def initialize_session_state() -> None:
     """Initialize the session state with default values."""
     if "user_chats" not in st.session_state:
@@ -64,6 +79,15 @@ def initialize_session_state() -> None:
             "title": EMPTY_CHAT_NAME,
             "messages": [],
         }
+    else:
+        # If we already have user_chats loaded from local DB, sanitize them
+        for chat_id, chat_obj in st.session_state.user_chats.items():
+            if "messages" in chat_obj:
+                _remove_tool_calls_from_conversation(chat_obj["messages"])
+
+        st.session_state["session_id"] = str(uuid.uuid4())
+        st.session_state.uploader_key = 0
+        st.session_state.run_id = None
 
 
 def display_messages() -> None:
@@ -155,6 +179,19 @@ def display_tool_output(
         st.markdown(msg, unsafe_allow_html=True)
 
 
+def _sanitize_human_message(msg_dict: dict) -> dict:
+    """
+    Remove leftover 'tool_calls' from a HumanMessage if present.
+    This prevents 'HumanMessage object has no attribute get' errors.
+    """
+    # If 'additional_kwargs' or direct 'tool_calls' keys exist on the dict, remove them
+    additional_kwargs = msg_dict.get("additional_kwargs", {})
+    if "tool_calls" in additional_kwargs:
+        del additional_kwargs["tool_calls"]
+    msg_dict["additional_kwargs"] = additional_kwargs
+    return msg_dict
+
+
 def handle_user_input(side_bar: SideBar) -> None:
     """Process user input, generate AI response, and update chat history."""
     prompt = st.chat_input() or st.session_state.modified_prompt
@@ -168,7 +205,7 @@ def handle_user_input(side_bar: SideBar) -> None:
         st.session_state["gcs_uris_to_be_sent"] = ""
         parts.append({"type": "text", "text": prompt})
         st.session_state.user_chats[st.session_state["session_id"]]["messages"].append(
-            HumanMessage(content=parts).model_dump()
+            _sanitize_human_message(HumanMessage(content=parts).model_dump())
         )
 
         display_user_input(parts)
